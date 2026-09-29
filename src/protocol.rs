@@ -1,12 +1,3 @@
-// Port of Protocol.h / Protocol.c
-//
-// yyjson is replaced by serde for reading (a borrowing visitor that keeps
-// yyjson_obj_get's semantics, see `Payload`) and by `JsonWriter` for writing
-// (same bytes as yyjson_mut_write without flags: insertion order, duplicate
-// keys allowed, fails on NaN/Inf and invalid UTF-8).
-//
-// ProtocolBindMsgpackArgsToStmt (cwpack) is not ported: it was never called.
-
 use rusqlite::types::ValueRef;
 use rusqlite::Statement;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -17,39 +8,23 @@ use std::io::Write;
 use crate::http_response::fmt_u64;
 use crate::log_warn;
 
-// ---------------------------------------------------------------------------
-// Request payload: {"q": "...", "args": [...]}
-// ---------------------------------------------------------------------------
-
-/// One element of `args`, as ProtocolBindJsonArgsToStmt sees it.
 #[derive(Debug, PartialEq)]
 pub enum Arg<'a> {
     Str(Cow<'a, str>),
-    /// yyjson_is_int (signed or unsigned); yyjson_get_sint reinterprets
-    /// values above i64::MAX.
     Int(i64),
     Real(f64),
     Bool(bool),
     Null,
-    /// Objects and arrays: not bound, but they still take an index.
     Skip,
 }
 
-/// What Service.c's Prepare() reads from the parsed document. yyjson_obj_get
-/// returns the *first* matching key, and nothing if the root isn't an object.
 #[derive(Debug, Default, PartialEq)]
 pub struct Payload<'a> {
-    /// None: no "q" key (or root isn't an object).
-    /// Some(None): "q" isn't a string (yyjson_get_str gives NULL, len 0).
     pub q: Option<Option<Cow<'a, str>>>,
-    /// None: no "args" key. A non-array "args" is Some(empty): it binds
-    /// nothing, same as yyjson_arr_size() == 0.
     pub args: Option<Vec<Arg<'a>>>,
 }
 
-/// yyjson_read(Payload, PayloadLen, 0): strict JSON, the whole buffer must be
-/// one document.
-pub fn protocol_parse_payload(payload: &[u8]) -> Result<Payload<'_>, serde_json::Error> {
+pub fn parse_payload(payload: &[u8]) -> Result<Payload<'_>, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(payload);
     let doc = de.deserialize_any(PayloadVisitor)?;
     de.end()?;
@@ -69,6 +44,7 @@ impl<'de> Visitor<'de> for PayloadVisitor {
         let mut doc = Payload::default();
         while let Some(key) = map.next_key::<Key>()? {
             match key {
+                // first key wins
                 Key::Q if doc.q.is_none() => doc.q = Some(map.next_value::<StrValue>()?.0),
                 Key::Args if doc.args.is_none() => {
                     doc.args = Some(map.next_value::<ArgsValue>()?.0.unwrap_or_default());
@@ -86,7 +62,6 @@ impl<'de> Visitor<'de> for PayloadVisitor {
         Ok(Payload::default())
     }
 
-    // Any scalar root: valid JSON, but no "q" in it.
     fn visit_bool<E>(self, _: bool) -> Result<Payload<'de>, E> {
         Ok(Payload::default())
     }
@@ -107,7 +82,6 @@ impl<'de> Visitor<'de> for PayloadVisitor {
     }
 }
 
-/// Object keys, matched without allocating.
 enum Key {
     Q,
     Args,
@@ -134,7 +108,6 @@ impl<'de> de::Deserialize<'de> for Key {
     }
 }
 
-/// "q": borrowed when the string has no escapes, None if it isn't a string.
 struct StrValue<'a>(Option<Cow<'a, str>>);
 
 impl<'de> de::Deserialize<'de> for StrValue<'de> {
@@ -146,7 +119,6 @@ impl<'de> de::Deserialize<'de> for StrValue<'de> {
     }
 }
 
-/// "args": Some(elements) for an array, None for anything else.
 struct ArgsValue<'a>(Option<Vec<Arg<'a>>>);
 
 impl<'de> de::Deserialize<'de> for ArgsValue<'de> {
@@ -191,7 +163,6 @@ impl<'de> de::Deserialize<'de> for ArgsValue<'de> {
     }
 }
 
-/// Any JSON value -> Arg (the type switch of ProtocolBindJsonArgsToStmt).
 struct ArgSeed;
 
 impl<'de> DeserializeSeed<'de> for ArgSeed {
@@ -241,10 +212,8 @@ impl<'de> Visitor<'de> for ArgSeed {
     }
 }
 
-/// ProtocolBindJsonArgsToStmt. Bind errors (e.g. more args than `?`s) are
-/// ignored, like the unchecked sqlite3_bind_* calls in C.
-pub fn protocol_bind_json_args_to_stmt(args: &[Arg], stmt: &mut Statement) -> i32 {
-    // TODO: ssleert - add normal error handling
+// TODO: ssleert - add normal error handling
+pub fn bind_args(args: &[Arg], stmt: &mut Statement) {
     for (i, arg) in args.iter().enumerate() {
         let idx = i + 1;
         let _ = match arg {
@@ -256,22 +225,13 @@ pub fn protocol_bind_json_args_to_stmt(args: &[Arg], stmt: &mut Statement) -> i3
             Arg::Skip => Ok(()),
         };
     }
-
-    0
 }
 
-// ---------------------------------------------------------------------------
-// Result rows -> JSON
-// ---------------------------------------------------------------------------
-
-/// Minimal stand-in for yyjson_mut_doc + yyjson_mut_write, writing straight
-/// into a byte buffer.
 pub struct JsonWriter<'a> {
     pub out: &'a mut Vec<u8>,
     pub failed: bool,
 }
 
-/// Bytes that must be escaped inside a JSON string: control chars, `"`, `\`.
 const NEEDS_ESCAPE: [bool; 256] = {
     let mut t = [false; 256];
     let mut i = 0;
@@ -290,11 +250,8 @@ const fn splat(b: u8) -> u64 {
     u64::from_ne_bytes([b; 8])
 }
 
-/// Whether any byte of the word is < 0x20, `"` or `\` (i.e. NEEDS_ESCAPE
-/// for any of its 8 bytes), with the classic exact SWAR tests:
-/// `hasless(x, n) = (x - n*0x01..) & !x & 0x80..` for n <= 128, and a byte
-/// equals `c` exactly when `x ^ c*0x01..` has a zero byte there.
 #[inline(always)]
+// swar, 8 bytes at a time
 fn word_needs_escape(w: u64) -> bool {
     const LO: u64 = splat(0x01);
     const HI: u64 = splat(0x80);
@@ -308,24 +265,18 @@ impl<'a> JsonWriter<'a> {
         JsonWriter { out, failed: false }
     }
 
-    /// Writes `s` as a JSON string, up to its first NUL (the C code only ever
-    /// sees NUL-terminated strings). `s` must be valid UTF-8 up to there.
-    /// Clean runs are found 8 bytes at a time and copied in bulk.
     fn write_str(&mut self, s: &[u8]) {
         self.out.reserve(s.len() + 2);
         self.out.push(b'"');
         let mut run_start = 0;
         let mut i = 0;
         while i < s.len() {
-            // Skip clean 8-byte words...
             while let Some(word) = s.get(i..i + 8) {
                 if word_needs_escape(u64::from_ne_bytes(word.try_into().unwrap())) {
                     break;
                 }
                 i += 8;
             }
-            // ...then walk byte-wise to the byte that stopped it (at most 7
-            // bytes away), or to the end of the tail.
             while i < s.len() && !NEEDS_ESCAPE[s[i] as usize] {
                 i += 1;
             }
@@ -353,13 +304,10 @@ impl<'a> JsonWriter<'a> {
         self.out.push(b'"');
     }
 
-    /// sqlite text as C sees it: sqlite3_column_text is NUL-terminated and
-    /// yyjson_mut_obj_add_strcpy strlen()s it, so text stops at the first
-    /// NUL. Invalid UTF-8 (before that NUL) fails like yyjson.
+    // text stops at NUL
     fn write_text(&mut self, bytes: &[u8]) {
         let valid = match std::str::from_utf8(bytes) {
             Ok(_) => true,
-            // Fine if the string ends (at a NUL) before the bad bytes.
             Err(e) => bytes[..e.valid_up_to()].contains(&0),
         };
         if !valid {
@@ -386,15 +334,10 @@ impl<'a> JsonWriter<'a> {
     }
 }
 
-/// ProtocolJsonFromStmt: steps `stmt` to the end, writing every row as an
-/// object. Err is the sqlite error that stopped the stepping (C returns the
-/// step rc and the caller reads sqlite3_errmsg).
-pub fn protocol_json_from_stmt(doc: &mut JsonWriter, stmt: &mut Statement) -> rusqlite::Result<()> {
+pub fn write_rows(doc: &mut JsonWriter, stmt: &mut Statement) -> rusqlite::Result<()> {
     let column_count = stmt.column_count();
 
-    // `"name":` for every column, escaped once per statement instead of once
-    // per cell (C re-adds the key for every row). A bad name only fails the
-    // write once a row uses it.
+    // keys escaped once, not per cell
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(column_count);
     let mut keys_failed = false;
     for i in 0..column_count {
@@ -431,6 +374,7 @@ pub fn protocol_json_from_stmt(doc: &mut JsonWriter, stmt: &mut Statement) -> ru
                 ValueRef::Integer(v) => doc.write_int(v),
                 ValueRef::Real(v) => doc.write_real(v),
                 ValueRef::Text(text) => doc.write_text(text),
+                // blobs -> null for now
                 ValueRef::Blob(_) => {
                     log_warn!("blobs unsupported");
                     doc.out.extend_from_slice(b"null");
@@ -452,13 +396,12 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    /// Runs `sql` on a fresh in-memory db and returns (ok, json, failed).
     fn run(sql: &str) -> (bool, String, bool) {
         let db = Connection::open_in_memory().unwrap();
         let mut stmt = db.prepare(sql).unwrap();
         let mut out = Vec::new();
         let mut doc = JsonWriter::new(&mut out);
-        let ok = protocol_json_from_stmt(&mut doc, &mut stmt).is_ok();
+        let ok = write_rows(&mut doc, &mut stmt).is_ok();
         let failed = doc.failed;
         (ok, String::from_utf8(out).unwrap(), failed)
     }
@@ -485,7 +428,6 @@ mod tests {
 
     #[test]
     fn string_escapes() {
-        // value: q"b\s/ LF CR TAB BS FF 0x01 0x1f DEL é€😀   column name: k"ey
         let (_, json, failed) = run(concat!(
             r#"SELECT 'q"b\s/' || char(10) || char(13) || char(9) || char(8) || char(12)"#,
             r#" || char(1) || char(31) || char(127) || 'é€😀' AS "k""ey""#,
@@ -501,16 +443,14 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_and_invalid_utf8_fail_like_yyjson() {
+    fn non_finite_and_invalid_utf8_fail() {
         assert!(run("SELECT 1e999 AS inf").2);
         assert!(run("SELECT CAST(x'ff' AS TEXT) AS bad").2);
-        // C never sees the bytes after a NUL, so they can't fail the write
         let (_, json, failed) = run("SELECT 'ok' || char(0) || CAST(x'ff' AS TEXT) AS t");
         assert!(!failed);
         assert_eq!(json, r#"[{"t":"ok"}]"#);
     }
 
-    /// The obvious byte-by-byte version, to check the word-at-a-time one.
     fn reference_escape(s: &[u8]) -> Vec<u8> {
         let s = &s[..s.iter().position(|&b| b == 0).unwrap_or(s.len())];
         let mut out = vec![b'"'];
@@ -531,7 +471,6 @@ mod tests {
         out
     }
 
-    /// The previous byte-table writer (no NUL handling), for timing.
     fn write_str_table(out: &mut Vec<u8>, s: &[u8]) {
         out.reserve(s.len() + 2);
         out.push(b'"');
@@ -553,11 +492,9 @@ mod tests {
         out.push(b'"');
     }
 
-    /// cargo test --release --bin riffdb json_micro -- --ignored --nocapture
     #[test]
     #[ignore]
     fn json_micro() {
-        // the strings of the bench's query_1000 rows
         let rows: Vec<(Vec<u8>, Vec<u8>)> = (1..=1000)
             .map(|x| {
                 (
@@ -625,7 +562,6 @@ mod tests {
     #[test]
     fn word_at_a_time_escaping_matches_reference() {
         let specials: &[u8] = &[b'"', b'\\', b'\n', 0x01, 0x1f, 0x20, 0x21, 0x5b, 0x5d, 0x7f, 0x80, 0xff, 0];
-        // every special byte at every position of strings up to 3 words long
         for len in 0..24 {
             for pos in 0..len {
                 for &sp in specials {
@@ -644,11 +580,11 @@ mod tests {
     }
 
     fn parse(s: &str) -> Option<Payload<'_>> {
-        protocol_parse_payload(s.as_bytes()).ok()
+        parse_payload(s.as_bytes()).ok()
     }
 
     #[test]
-    fn payload_like_yyjson_obj_get() {
+    fn payload_parsing() {
         let p = parse(r#"{"q":"SELECT ?","args":["s",1,-2,1.5,true,null,[1],{"a":1},18446744073709551615]}"#).unwrap();
         assert_eq!(p.q, Some(Some(Cow::Borrowed("SELECT ?"))));
         assert_eq!(
@@ -662,22 +598,17 @@ mod tests {
                 Arg::Null,
                 Arg::Skip,
                 Arg::Skip,
-                Arg::Int(-1), // u64::MAX reinterpreted, like yyjson_get_sint
+                Arg::Int(-1),
             ]
         );
 
-        // first key wins
         assert_eq!(parse(r#"{"q":"first","q":"second"}"#).unwrap().q, Some(Some("first".into())));
-        // non-string q, missing q, non-object root
         assert_eq!(parse(r#"{"q":5}"#).unwrap().q, Some(None));
         assert_eq!(parse(r#"{"x":1}"#).unwrap().q, None);
         assert_eq!(parse(r#"[{"q":"x"}]"#).unwrap(), Payload::default());
         assert_eq!(parse("42").unwrap(), Payload::default());
-        // non-array args bind nothing
         assert_eq!(parse(r#"{"q":"x","args":{"a":1}}"#).unwrap().args, Some(vec![]));
-        // escaped strings are unescaped (owned)
         assert_eq!(parse(r#"{"q":"a\"bé"}"#).unwrap().q, Some(Some(Cow::Owned("a\"bé".into()))));
-        // invalid JSON / trailing content / empty
         assert!(parse("not json").is_none());
         assert!(parse(r#"{"q":"x"} x"#).is_none());
         assert!(parse("").is_none());

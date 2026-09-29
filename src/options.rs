@@ -1,14 +1,3 @@
-// Port of Options.h / Options.c
-//
-// getopt_long isn't available on every target, so a small GNU-compatible
-// subset is re-implemented here: short options (clustered, attached or
-// separate argument), long options (`--opt val`, `--opt=val`, unambiguous
-// prefixes), `--` terminator, and argv permutation (non-options collected and
-// reported afterwards).
-//
-// C keeps the result in a mutable global (GOptions). Here parse_options
-// returns an owned Options, and main publishes it once via set_options.
-
 use std::sync::OnceLock;
 
 const DEFAULT_PORT: u16 = 9889;
@@ -22,21 +11,20 @@ pub struct Options {
     pub show_version: bool,
 }
 
-static G_OPTIONS: OnceLock<Options> = OnceLock::new();
+static OPTIONS: OnceLock<Options> = OnceLock::new();
 
-/// The options main() published. Panics if called before `set_options`.
 pub fn options() -> &'static Options {
-    G_OPTIONS.get().expect("options not initialised")
+    OPTIONS.get().expect("options not initialised")
 }
 
 pub fn set_options(options: Options) -> &'static Options {
-    let _ = G_OPTIONS.set(options);
+    let _ = OPTIONS.set(options);
     self::options()
 }
 
-fn get_default_threads() -> u16 {
+fn default_threads() -> u8 {
     std::thread::available_parallelism()
-        .map(|n| n.get() as u16)
+        .map(|n| n.get().min(u8::MAX as usize) as u8)
         .unwrap_or(1)
 }
 
@@ -65,7 +53,7 @@ struct LongOption {
     val: char,
 }
 
-static LONG_OPTIONS: [LongOption; 5] = [
+static LONOPTIONS: [LongOption; 5] = [
     LongOption { name: "port", has_arg: true, val: 'p' },
     LongOption { name: "directory", has_arg: true, val: 'd' },
     LongOption { name: "threads", has_arg: true, val: 't' },
@@ -75,7 +63,6 @@ static LONG_OPTIONS: [LongOption; 5] = [
 
 const SHORT_OPTIONS: &str = "p:d:t:hv";
 
-/// Returns Some(has_arg) for a known short option.
 fn short_has_arg(c: char) -> Option<bool> {
     if c == ':' {
         return None;
@@ -84,9 +71,7 @@ fn short_has_arg(c: char) -> Option<bool> {
     Some(SHORT_OPTIONS.as_bytes().get(pos + 1) == Some(&b':'))
 }
 
-/// Parses `-p` / `-t` values the same way as strtol + range checks.
 fn parse_ranged(s: &str, min: i64, max: i64) -> Option<i64> {
-    // strtol: leading whitespace and sign allowed, whole string must be consumed
     let t = s.trim_start();
     if t.is_empty() {
         return None;
@@ -132,7 +117,7 @@ pub fn parse_options(argv: &[String]) -> Result<Options, ()> {
     let mut opts = Options {
         port: DEFAULT_PORT,
         directory: ".".to_string(),
-        threads: get_default_threads() as u8,
+        threads: default_threads(),
         show_help: false,
         show_version: false,
     };
@@ -156,12 +141,12 @@ pub fn parse_options(argv: &[String]) -> Result<Options, ()> {
                 None => (long, None),
             };
 
-            let exact = LONG_OPTIONS.iter().find(|o| o.name == name);
+            let exact = LONOPTIONS.iter().find(|o| o.name == name);
             let matched = match exact {
                 Some(o) => Some(o),
                 None => {
                     let candidates: Vec<&LongOption> =
-                        LONG_OPTIONS.iter().filter(|o| o.name.starts_with(name)).collect();
+                        LONOPTIONS.iter().filter(|o| o.name.starts_with(name)).collect();
                     if candidates.len() > 1 {
                         eprintln!("{}: option '--{}' is ambiguous", argv0, name);
                         return Err(());
@@ -270,7 +255,7 @@ mod tests {
         assert_eq!((o.port, o.directory.as_str(), o.threads), (80, "/tmp/x", 4));
         assert!(o.show_help && o.show_version);
 
-        let o = parse(&["--port", "81", "--thr", "2"]).unwrap(); // unambiguous prefix
+        let o = parse(&["--port", "81", "--thr", "2"]).unwrap();
         assert_eq!((o.port, o.threads), (81, 2));
     }
 
@@ -285,6 +270,6 @@ mod tests {
         assert!(parse(&["--nope"]).is_err());
         assert!(parse(&["--help=1"]).is_err());
         assert!(parse(&["stray"]).is_err());
-        assert!(parse(&["--", "-p", "1"]).is_err()); // after -- everything is positional
+        assert!(parse(&["--", "-p", "1"]).is_err());
     }
 }

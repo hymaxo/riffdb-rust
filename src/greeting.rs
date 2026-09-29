@@ -1,8 +1,3 @@
-// Port of Greeting.h / Greeting.c
-//
-// The C version prints these lines with puts(), so the "%%" sequences are
-// printed literally. Kept as-is.
-
 pub fn greeting() {
     static ASCII: [&str; 18] = [
         "                                    ",
@@ -25,7 +20,7 @@ pub fn greeting() {
         "                                    ",
     ];
 
-    for line in ASCII.iter() {
-        println!("{}", line);
+    for line in ASCII {
+        println!("{line}");
     }
 }

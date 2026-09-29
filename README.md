@@ -1,9 +1,8 @@
-# riffdb-rust
+# riffdb
 
-**SQLite over HTTP, in safe Rust.** riffdb is a small, fast database server: it keeps a
-single SQLite database on disk and lets any client that speaks HTTP and JSON run SQL
-against it. There's no driver to install and no binary protocol to implement. `curl`
-is enough.
+**SQLite over HTTP.** riffdb is a small, fast database server. It keeps one SQLite
+database on disk and lets any client that can send HTTP and JSON run SQL against it.
+You don't need a driver or a binary protocol; `curl` works.
 
 ```sh
 cargo run --release -- -p 9889 -d ./data
@@ -16,43 +15,27 @@ curl -X POST localhost:9889/query   -d '{"q":"SELECT * FROM users WHERE id = ?",
 # [{"id":1,"name":"ada"}]
 ```
 
-## What problem it solves
+## Why
 
-SQLite is a great database, but it's a library: only the process that links it can use
-it. As soon as a second service, a script in another language, or a runtime without
-native bindings (edge functions, Deno, a browser tool) needs the data, you have two
-options. You can move to a client/server database, or you can put something in front
-of SQLite.
+SQLite is a great database, but it's a library, so only the process that links it
+can use it. Once a second service, a script in another language, or a runtime
+without native bindings (edge functions, Deno, a browser tool) needs the same data,
+you either move to a client/server database or put something in front of SQLite.
 
-riffdb is that something, kept deliberately small:
+riffdb is a small thing to put in front of it:
 
-- **One file, one process.** The data is a plain `riff.db` SQLite file, which you can
-  open, back up or inspect with any SQLite tool.
-- **Zero client dependencies.** Any HTTP client works. Queries are parameterized
-  (`args`), so there's no string-building SQL on the client side.
-- **Fast by design.** One network thread multiplexes every connection over
-  epoll, kqueue or IOCP. A pool of workers, each with its own SQLite connection in WAL
-  mode, runs the queries. Results are streamed straight into the response buffer as
-  JSON.
-- **Safe.** The crate is `#![forbid(unsafe_code)]`. The only unsafe code is inside
-  SQLite itself and the standard, widely used crates underneath.
+- **One file, one process.** The data lives in a plain `riff.db` SQLite file, which
+  you can open, back up or inspect with any SQLite tool.
+- **No client library needed.** Any HTTP client works. Queries take parameters
+  (`args`), so clients don't build SQL strings.
+- **Fast.** One network thread handles every connection with epoll, kqueue or IOCP.
+  A pool of workers, each with its own SQLite connection in WAL mode, runs the
+  queries, and rows are written straight into the response as JSON.
+- **Memory-safe.** The crate is `#![forbid(unsafe_code)]`. The only unsafe code is
+  in SQLite itself and in widely used crates underneath.
 
-It is not a replacement for a networked RDBMS. There's no auth or TLS, and it's meant
-to sit on localhost or inside a private network, next to the services that use it.
-
-## Based on
-
-This is a port of **[ssleert/riffdb](https://github.com/ssleert/riffdb)**, written in C.
-The module layout follows the C sources one to one, and the wire protocol, error
-messages and even the quirks are the same, so existing clients such as the original
-[`riffdb.js`](https://github.com/ssleert/riffdb/tree/master/packages/riffdb.js) work
-unchanged. The original's JS test suite is ported and runs against this server.
-
-It went through three stages: a direct raw-pointer port, then an incremental migration
-to safe Rust, then assembly-guided optimization. Along the way it fixes the C version's
-memory-safety bugs: a heap overflow on responses over 8 KB, a keep-alive race with more
-than one worker, a use-after-free on disconnect, truncated large responses, and leaks.
-See [docs/PORTING.md](docs/PORTING.md) for the full list.
+It doesn't replace a networked RDBMS. There is no auth and no TLS, so run it on
+localhost or inside a private network, next to the services that use it.
 
 ## Usage
 
@@ -64,7 +47,8 @@ riffdb [OPTIONS]
   -h, --help / -v, --version
 ```
 
-The database is created on first start (`<DIR>/riff.db`, WAL mode).
+The database (`<DIR>/riff.db`, WAL mode) is created on first start. Set `NO_COLOR`
+to turn off colored logs.
 
 ### API
 
@@ -72,72 +56,65 @@ The database is created on first start (`<DIR>/riff.db`, WAL mode).
 |---|---|---|
 | `POST /query` | `{"q": "<sql>", "args": [...]}` | `200`, a JSON array of row objects |
 | `POST /execute` | `{"q": "<sql>", "args": [...]}` | `200`, `ok` |
-| `GET /health` | — | `200`, `health` |
+| `GET /health` | none | `200`, `health` |
 
-- `args` is optional. Its values (numbers, strings, booleans, `null`) bind to the `?`
-  placeholders in order.
+- `args` is optional. Its values (numbers, strings, booleans, `null`) are bound to the
+  `?` placeholders in order.
 - Only the first statement in `q` runs.
 - Errors return `500` with the SQLite error message as a plain-text body, for example
   `no such table: users`. Unknown routes return `404`.
+- Each worker has its own connection, so per-connection settings such as
+  `PRAGMA foreign_keys` only apply to requests that land on that worker. Use `-t 1`
+  if you rely on them.
 
-## Benchmarks
+## Performance
 
-These compare the C original with this port. Both were built and run in the same Linux
-container (Docker Desktop, 16 threads). C used its own release flags
-(`-Ofast -march=native`, LTO, mimalloc); Rust used a plain `cargo build --release`. The
-client used keep-alive connections, one request in flight per connection. Full method,
-raw output and a one-command rerun are in [compare/](compare/README.md).
+With 4 workers and 32 keep-alive connections, riffdb serves about 100k point
+queries/s and 70k single-row `UPDATE`s/s, with p99 latency around 1 ms. With 8
+connections, a 1000-row result (93 KB of JSON) has a median latency of about 0.5 ms.
+These numbers come from a Linux container on a 16-thread desktop, with the load
+generator running on the same machine.
 
-4 workers, 32 connections:
+Most of the speed comes from three things:
 
-| scenario | C (req/s) | Rust (req/s) | Rust vs C |
-|---|---:|---:|---:|
-| `/health` (no SQLite) | 155,553 ⚠ | 154,150 | on par |
-| point query (1 row) | 90,343 ⚠ | 102,104 | **1.13×** |
-| 50-row query (~4 KB JSON) | 59,394 ⚠ | 71,441 | **1.20×** |
-| 1000-row query (93 KB JSON) | crashes | 11,234 | — |
-| single-row `UPDATE` | 25,427 | 70,512 | **2.77×** |
+- prepared statements are cached per worker;
+- rows are written straight into the response buffer, with no intermediate JSON
+  tree;
+- a writer that hits SQLite's lock retries within microseconds instead of sleeping
+  for whole milliseconds.
 
-⚠ = C sent corrupted responses during the run. Rust had zero errors in every run.
-
-What the numbers show:
-
-- **Networking is on par.** A mio event loop matches the hand-written C `poll()` loop.
-- **Queries are 13–24% faster** (13–20% here; up to 24% in the 1-worker runs in
-  [compare/](compare/README.md)). The gain comes from a per-worker prepared-statement
-  cache and from streaming rows straight into the response instead of building a JSON
-  tree and copying it.
-- **Writes are 2.8–3.5× faster.** When a write waits for SQLite's lock, it retries on a
-  microsecond scale instead of sleeping 1–100 ms.
-- **The C original can't return large results**: any response over 8 KB overflows its
-  buffer and kills the process. With more than one worker it also corrupts keep-alive
-  responses.
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) covers how to measure and what was
+optimized. [compare/](compare/README.md) has a reproducible benchmark against the
+original C implementation.
 
 ## Development
 
 ```sh
-cargo test --release        # unit tests, the ported riffdb.js suite, and wire tests
+cargo test --release                              # unit, client-suite and wire tests
 cargo run --release --example bench -- 9889 8 5   # load a running server
 ```
 
-- [docs/PORTING.md](docs/PORTING.md): architecture, the C-to-Rust file mapping,
-  library substitutions, every deliberate deviation, and the C quirks that were kept.
-- [docs/MIGRATION.md](docs/MIGRATION.md): how the raw-pointer port became safe Rust.
-- [docs/PERFORMANCE.md](docs/PERFORMANCE.md): how to benchmark and read the assembly,
-  what was optimized, and the inefficiencies found in the C code.
-- [compare/](compare/README.md): the benchmark against the C original.
+- **Unit tests** cover the HTTP parser, response bytes, JSON output, payload parsing,
+  the queue, channel and pool, routing and options.
+- **`tests/mod_test.rs`** runs the riffdb.js client test suite against a live server.
+- **`tests/wire.rs`** checks exact response bytes on raw keep-alive sockets against
+  several workers.
 
-Tests:
+Set `RIFFDB_BIN=<exe>` to point the integration tests at another build. Everything
+passes on Linux and Windows.
 
-- **Unit tests**: parser, response bytes, JSON output, protocol, queue, channel, pool,
-  router, options.
-- **`tests/mod_test.rs`**: a port of the original `riffdb.js` test suite.
-- **`tests/wire.rs`**: raw keep-alive sockets against 4 workers, checking response
-  integrity.
+More in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how a request flows through
+the server, the modules, and protocol details) and
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-All three pass on Windows and Linux. `RIFFDB_BIN=<exe>` points the integration suites
-at another build.
+## Credits
+
+riffdb was created by [ssleert](https://github.com/ssleert/riffdb) in C. This is a
+Rust implementation of the same server. It keeps the wire protocol, so existing
+clients such as
+[`riffdb.js`](https://github.com/ssleert/riffdb/tree/master/packages/riffdb.js) work
+unchanged.
 
 ## License
 
-The original riffdb is licensed under GPL-3.0. This port is a derivative work of it.
+GPL-3.0, the same as the original riffdb.

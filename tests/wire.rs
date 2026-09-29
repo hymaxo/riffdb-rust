@@ -1,6 +1,5 @@
-// Wire-level regression tests (not from the JS suite): exact bytes on a raw
-// keep-alive socket, against a multi-worker server. These pin the behaviour
-// the unsafe -> safe migration must preserve, including the PORT FIXes.
+// Wire-level regression tests: exact bytes on a raw keep-alive socket,
+// against a multi-worker server.
 
 mod common;
 
@@ -61,8 +60,8 @@ fn exact_response_bytes() {
 
 #[test]
 fn keep_alive_with_many_workers_never_mixes_responses() {
-    // Regression for the send-then-zero race (see worker.rs PORT FIX):
-    // back-to-back requests on one connection land on different workers.
+    // Back-to-back requests on one connection land on different workers,
+    // and each response must still arrive whole and in order.
     let s = Server::start_with_threads(4);
     let mut c = connect(&s);
     for i in 0..2000 {
@@ -82,7 +81,7 @@ fn keep_alive_with_many_workers_never_mixes_responses() {
 
 #[test]
 fn headers_and_body_in_separate_writes() {
-    // PORT FIX 3 + 4: the body arrives in later read()s than the headers.
+    // The body arrives in later read()s than the headers.
     let s = Server::start_with_threads(4);
     let mut c = connect(&s);
     for _ in 0..20 {
@@ -99,7 +98,8 @@ fn headers_and_body_in_separate_writes() {
 
 #[test]
 fn large_request_body_and_large_response() {
-    // PORT FIX 1 (response growth) and multi-read bodies.
+    // Responses far past the initial buffer size, and bodies spread over
+    // many reads.
     let s = Server::start_with_threads(4);
     let mut c = connect(&s);
     let big = "x".repeat(200_000);
