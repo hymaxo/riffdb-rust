@@ -1,7 +1,7 @@
 // Port of main.h / main.c
 //
 // Rust port of https://github.com/ssleert/riffdb. Module layout is 1:1 with
-// the C sources; see README.md for the mapping and the list of deliberate
+// the C sources; see docs/PORTING.md for the mapping and the list of deliberate
 // deviations (marked `PORT FIX` / `PORT NOTE` in code).
 
 #![forbid(unsafe_code)]

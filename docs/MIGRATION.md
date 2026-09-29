@@ -35,8 +35,8 @@ version is commit `1b179b5`.
 
 ## Behaviour changes
 
-Everything else is kept. The complete list with reasons is in the README
-("Deliberate deviations from C"):
+Everything else is kept. The complete list with reasons is in
+[PORTING.md](PORTING.md#deliberate-deviations-from-c):
 
 - the ten PORT FIXes (memory safety, races, leaks, partial sends, more than 24 headers);
 - finer busy-handler waits (same 5 s timeout) and a prepared-statement cache;

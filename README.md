@@ -1,139 +1,143 @@
-# riffdb (Rust port)
+# riffdb-rust
 
-A port of [ssleert/riffdb](https://github.com/ssleert/riffdb): SQLite over HTTP.
-The module layout follows the C sources one to one, and the behaviour on the
-wire is kept the same, including the C code's quirks. The crate is entirely
-safe Rust (`#![forbid(unsafe_code)]`).
+**SQLite over HTTP, in safe Rust.** riffdb is a small, fast database server: it keeps a
+single SQLite database on disk and lets any client that speaks HTTP and JSON run SQL
+against it. There's no driver to install and no binary protocol to implement. `curl`
+is enough.
+
+```sh
+cargo run --release -- -p 9889 -d ./data
+
+curl -X POST localhost:9889/execute -d '{"q":"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"}'
+# ok
+curl -X POST localhost:9889/execute -d '{"q":"INSERT INTO users (name) VALUES (?)","args":["ada"]}'
+# ok
+curl -X POST localhost:9889/query   -d '{"q":"SELECT * FROM users WHERE id = ?","args":[1]}'
+# [{"id":1,"name":"ada"}]
+```
+
+## What problem it solves
+
+SQLite is a great database, but it's a library: only the process that links it can use
+it. As soon as a second service, a script in another language, or a runtime without
+native bindings (edge functions, Deno, a browser tool) needs the data, you have two
+options. You can move to a client/server database, or you can put something in front
+of SQLite.
+
+riffdb is that something, kept deliberately small:
+
+- **One file, one process.** The data is a plain `riff.db` SQLite file, which you can
+  open, back up or inspect with any SQLite tool.
+- **Zero client dependencies.** Any HTTP client works. Queries are parameterized
+  (`args`), so there's no string-building SQL on the client side.
+- **Fast by design.** One network thread multiplexes every connection over
+  epoll, kqueue or IOCP. A pool of workers, each with its own SQLite connection in WAL
+  mode, runs the queries. Results are streamed straight into the response buffer as
+  JSON.
+- **Safe.** The crate is `#![forbid(unsafe_code)]`. The only unsafe code is inside
+  SQLite itself and the standard, widely used crates underneath.
+
+It is not a replacement for a networked RDBMS. There's no auth or TLS, and it's meant
+to sit on localhost or inside a private network, next to the services that use it.
+
+## Based on
+
+This is a port of **[ssleert/riffdb](https://github.com/ssleert/riffdb)**, written in C.
+The module layout follows the C sources one to one, and the wire protocol, error
+messages and even the quirks are the same, so existing clients such as the original
+[`riffdb.js`](https://github.com/ssleert/riffdb/tree/master/packages/riffdb.js) work
+unchanged. The original's JS test suite is ported and runs against this server.
+
+It went through three stages: a direct raw-pointer port, then an incremental migration
+to safe Rust, then assembly-guided optimization. Along the way it fixes the C version's
+memory-safety bugs: a heap overflow on responses over 8 KB, a keep-alive race with more
+than one worker, a use-after-free on disconnect, truncated large responses, and leaks.
+See [docs/PORTING.md](docs/PORTING.md) for the full list.
+
+## Usage
 
 ```
-cargo run -- -p 9889 -t 4 -d ./data
-curl -X POST localhost:9889/query -d '{"q":"SELECT ? AS x","args":[1]}'
+riffdb [OPTIONS]
+  -p, --port PORT        Listen port (default: 9889)
+  -d, --directory DIR    Where riff.db lives (default: current directory)
+  -t, --threads N        Worker threads (default: logical CPU count)
+  -h, --help / -v, --version
 ```
 
-Endpoints: `POST /execute`, `POST /query` (JSON body `{"q": "...", "args": [...]}`), `GET /health`.
+The database is created on first start (`<DIR>/riff.db`, WAL mode).
 
-## Docs
+### API
 
+| endpoint | body | success |
+|---|---|---|
+| `POST /query` | `{"q": "<sql>", "args": [...]}` | `200`, a JSON array of row objects |
+| `POST /execute` | `{"q": "<sql>", "args": [...]}` | `200`, `ok` |
+| `GET /health` | — | `200`, `health` |
+
+- `args` is optional. Its values (numbers, strings, booleans, `null`) bind to the `?`
+  placeholders in order.
+- Only the first statement in `q` runs.
+- Errors return `500` with the SQLite error message as a plain-text body, for example
+  `no such table: users`. Unknown routes return `404`.
+
+## Benchmarks
+
+These compare the C original with this port. Both were built and run in the same Linux
+container (Docker Desktop, 16 threads). C used its own release flags
+(`-Ofast -march=native`, LTO, mimalloc); Rust used a plain `cargo build --release`. The
+client used keep-alive connections, one request in flight per connection. Full method,
+raw output and a one-command rerun are in [compare/](compare/README.md).
+
+4 workers, 32 connections:
+
+| scenario | C (req/s) | Rust (req/s) | Rust vs C |
+|---|---:|---:|---:|
+| `/health` (no SQLite) | 155,553 ⚠ | 154,150 | on par |
+| point query (1 row) | 90,343 ⚠ | 102,104 | **1.13×** |
+| 50-row query (~4 KB JSON) | 59,394 ⚠ | 71,441 | **1.20×** |
+| 1000-row query (93 KB JSON) | crashes | 11,234 | — |
+| single-row `UPDATE` | 25,427 | 70,512 | **2.77×** |
+
+⚠ = C sent corrupted responses during the run. Rust had zero errors in every run.
+
+What the numbers show:
+
+- **Networking is on par.** A mio event loop matches the hand-written C `poll()` loop.
+- **Queries are 13–24% faster** (13–20% here; up to 24% in the 1-worker runs in
+  [compare/](compare/README.md)). The gain comes from a per-worker prepared-statement
+  cache and from streaming rows straight into the response instead of building a JSON
+  tree and copying it.
+- **Writes are 2.8–3.5× faster.** When a write waits for SQLite's lock, it retries on a
+  microsecond scale instead of sleeping 1–100 ms.
+- **The C original can't return large results**: any response over 8 KB overflows its
+  buffer and kills the process. With more than one worker it also corrupts keep-alive
+  responses.
+
+## Development
+
+```sh
+cargo test --release        # unit tests, the ported riffdb.js suite, and wire tests
+cargo run --release --example bench -- 9889 8 5   # load a running server
+```
+
+- [docs/PORTING.md](docs/PORTING.md): architecture, the C-to-Rust file mapping,
+  library substitutions, every deliberate deviation, and the C quirks that were kept.
+- [docs/MIGRATION.md](docs/MIGRATION.md): how the raw-pointer port became safe Rust.
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md): how to benchmark and read the assembly,
-  what was optimized and by how much, and the inefficiencies found in the C code.
-- [docs/MIGRATION.md](docs/MIGRATION.md): how the unsafe port became safe, and what
-  replaced each unsafe construct.
-- [compare/](compare/README.md): a benchmark against the C original, with both built in one
-  Linux container. Networking is at parity, queries are 1.1–1.25× faster, writes 2.8–3.5×
-  faster, and the port has no errors where C crashes or corrupts responses.
+  what was optimized, and the inefficiencies found in the C code.
+- [compare/](compare/README.md): the benchmark against the C original.
 
-## Architecture (same as C)
+Tests:
 
-One network thread polls the listening socket and all clients. It parses requests
-byte by byte and hands each complete request to a pool of worker threads,
-round-robin, through one mailbox per worker. Each worker has its own SQLite
-connection. It routes the request, builds the response and writes it to the
-client socket.
+- **Unit tests**: parser, response bytes, JSON output, protocol, queue, channel, pool,
+  router, options.
+- **`tests/mod_test.rs`**: a port of the original `riffdb.js` test suite.
+- **`tests/wire.rs`**: raw keep-alive sockets against 4 workers, checking response
+  integrity.
 
-The difference is ownership. In C, one heap `Request` per connection is shared
-by the network thread and the workers through a raw pointer. Here:
+All three pass on Windows and Linux. `RIFFDB_BIN=<exe>` points the integration suites
+at another build.
 
-- the network thread owns each connection's parser (`Connection`);
-- a finished request is **moved** to a worker as a `Request` (URL, body, and an
-  `Arc` to the socket and cancel flag);
-- each worker owns its own response buffer.
+## License
 
-## File mapping
-
-| C                              | Rust                  |
-|--------------------------------|-----------------------|
-| main.c / main.h                | main.rs               |
-| Options.c                      | options.rs (hand-rolled `getopt_long`) |
-| Log.c / Log.h                  | log.rs (`log_trace!` … `log_fatal!` macros) |
-| XMalloc.c                      | (gone: Rust allocations)   |
-| Utils.c                        | utils.rs              |
-| Greeting.c                     | greeting.rs           |
-| Any.h                          | any.rs (an enum; unused, as in C) |
-| Queue.c                        | queue.rs (generic `Queue<T>`) |
-| Channel.c                      | channel.rs (`Mutex` + `Condvar`, generic, closable) |
-| ThreadPool.c                   | thread_pool.rs (`std::thread`, shared state in an `Arc`) |
-| TcpServer.c                    | tcp_server.rs (`mio` + `socket2`, callbacks as a trait) |
-| SocketActions.c                | socket_actions.rs (+ `Connection`, the network thread's half of `Request`) |
-| HttpParser.c                   | http_parser.rs (same state machine, owned buffers) |
-| HttpResponse.c / HttpUtils.c   | http_response.rs / http_utils.rs |
-| Request.h                      | request.rs (what moves to a worker) |
-| Router.c                       | router.rs             |
-| Execute.c / Query.c            | execute.rs / query.rs |
-| Service.c                      | service.rs            |
-| Protocol.c                     | protocol.rs           |
-| DataBase.c                     | database.rs           |
-
-## Library substitutions
-
-- **sqlite**: `rusqlite` on top of the bundled `libsqlite3-sys`. The compile flags
-  from `CMakeLists.txt` are passed through `.cargo/config.toml`. The one exception is
-  `SQLITE_OMIT_AUTOINIT`: sqlite now initialises itself on first use, because
-  `sqlite3_initialize()` has no safe binding. There is no visible difference.
-- **yyjson**: requests are read with a borrowing serde visitor that keeps
-  `yyjson_obj_get` semantics (first key wins, a non-object root means "no q").
-  Responses are written by a writer in `protocol.rs` that produces yyjson's exact bytes.
-- **poll / sockets**: `mio` (epoll / kqueue / IOCP) and `socket2`, which sets the
-  same listen options as C: `SO_REUSEADDR`, `SO_REUSEPORT` on Linux, backlog 128.
-- **cwpack**: dropped. `ProtocolBindMsgpackArgsToStmt` was never called.
-- **wolfssl**: dropped. It was only initialised and printed in `--version`.
-- **mimalloc**: not used. Release builds use the system allocator.
-
-## Deliberate deviations from C
-
-Each of these fixes memory corruption, a race, or a request-breaking bug in the C
-code. The code marks them `PORT FIX`. Everything else, quirks included, behaves
-like C.
-
-1. **Response buffer overflow.** `HttpResponseAppend` doubled the capacity only once, so
-   responses over about 8 KB overflowed the heap. The buffer is now a `Vec`.
-2. **Body overflow.** `HttpParserParseBody` copied bytes beyond Content-Length into the
-   body buffer (heap overflow on pipelined requests). The copy is clamped.
-3. **`BodyStart` re-applied.** When the body arrived in a later `read()` than the headers,
-   the offset was applied again. It is now applied once.
-4. **Incomplete bodies dispatched.** `SocketActionsOnReadable` sent requests to a worker
-   before the body was complete. It now waits for `Complete`.
-5. **Keep-alive race.** With more than one worker, back-to-back keep-alive requests got
-   corrupted responses (send-then-zero race). Each worker now has its own buffer.
-6. **Use-after-free on disconnect.** A disconnect freed buffers a worker might still be
-   using. Requests are now owned, and a disconnect only sets `cancel`.
-7. **Truncated responses.** Large responses could be cut off by a partial `send()`. The
-   worker now writes until done: it retries on `WouldBlock`, gives up once the client
-   has disconnected, and times out after 10 s with no progress.
-8. **Leaks.** Error strings, the yyjson request and response buffers, and every `Request`
-   were leaked; they no longer are.
-9. **More than 24 headers.** C writes past the end of `Headers[]`; the extra headers
-   are now ignored.
-10. **Windows port sharing.** `SO_REUSEADDR` is not set on Windows, because there it lets
-    a second server share the port.
-11. **Lock waits.** The 5 s busy timeout is kept, but the wait between retries is 20 µs–1 ms
-    instead of sqlite's 1–100 ms sleeps (15.6 ms each on Windows). Contended `/execute` went
-    from about 600 to about 100k req/s. Prepared statements are also cached per worker; this
-    changes no output. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-
-## Kept as in C
-
-- Routes are matched by a sum-of-chars hash, so e.g. `/yreuq` routes to `/query`.
-- Invalid JSON returns the error message `query len < 3`.
-- Only `Content-Length` and `content-length` are recognised.
-- Requests are dispatched round-robin. Pipelined requests on one connection may be
-  answered out of order, and a full mailbox (1024 requests) silently drops the request.
-- Only the first SQL statement of `q` runs; the rest is ignored.
-- Per-connection state such as `PRAGMA foreign_keys` applies only to the worker
-  connection that ran it.
-
-## Tests
-
-`cargo test --release` runs three suites:
-
-- **Unit tests:** the parser at every split point, the exact response bytes, golden
-  JSON, payload semantics, word-at-a-time escaping against a reference, the queue,
-  channel, thread pool, router and options.
-- **`tests/mod_test.rs`:** a port of `packages/riffdb.js/mod_test.ts` against the real
-  binary, with 1 worker as in `.vscode/launch.json`. Two tests are `#[ignore]`d
-  because they fail against the C server too: `blob_round_trip` (BLOBs aren't
-  supported by the wire protocol) and `large_batch_insert` (it binds the `VALUES` list
-  as a parameter). `large_batch_insert_inlined` is the working version of the second.
-- **`tests/wire.rs`:** raw keep-alive sockets against 4 workers. It checks response
-  integrity, split writes, 200 KB bodies and responses, and the error messages.
-
-`RIFFDB_BIN=<exe>` runs the integration suites against another build.
+The original riffdb is licensed under GPL-3.0. This port is a derivative work of it.

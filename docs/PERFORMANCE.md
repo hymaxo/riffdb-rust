@@ -164,7 +164,7 @@ Correctness:
   `/query` and `/execute`. The `yyjson_mut_write` output buffer is leaked for every `/query`.
   sqlite error strings are leaked, because the `XFree` sits after a `return`.
   *Port:* nothing leaks (owned buffers).
-- Also listed in the README: heap overflow on responses over about 8 KB, body overflow on pipelined
+- Also listed in [PORTING.md](PORTING.md#deliberate-deviations-from-c): heap overflow on responses over about 8 KB, body overflow on pipelined
   bytes, re-applied `BodyStart`, dispatch before the body is complete, more than 24 headers, the
   use-after-free on disconnect.
 
