@@ -1,6 +1,3 @@
-// The /query and /execute logic: parse the payload, prepare and bind the
-// statement, run it.
-
 use rusqlite::{CachedStatement, Connection, Statement};
 use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
@@ -11,9 +8,7 @@ use crate::protocol::{bind_args, parse_payload, write_rows, JsonWriter};
 
 #[derive(Debug)]
 pub enum ServiceError {
-    /// The client went away; nothing should be sent.
     Cancelled,
-    /// Answered with a 500 and this message as the body.
     Failed(Cow<'static, str>),
 }
 
@@ -23,7 +18,6 @@ impl ServiceError {
     }
 }
 
-/// A statement from the connection's cache, or a one-off one.
 enum Prepared<'db> {
     Cached(CachedStatement<'db>),
     Fresh(Statement<'db>),
@@ -54,24 +48,19 @@ fn prepare<'db>(cancel: &AtomicBool, db: &'db Connection, payload: &[u8]) -> Res
     if cancel.load(Ordering::SeqCst) {
         return Err(ServiceError::Cancelled);
     }
-    // Clients match on these messages, so they stay as they are, including
-    // the odd one for invalid JSON.
+    // yes, "query len < 3" for bad json. clients match on it
     let Ok(doc) = parse_payload(payload) else {
         return Err(ServiceError::Failed(Cow::Borrowed("query len < 3")));
     };
     let Some(q) = doc.q else {
         return Err(ServiceError::Failed(Cow::Borrowed("query is empty")));
     };
-    // A non-string "q" counts as an empty string.
     let sql: &str = q.as_deref().unwrap_or("");
     if sql.len() < 3 {
         return Err(ServiceError::Failed(Cow::Borrowed("query len < 3")));
     }
 
-    // rusqlite's statement cache resets statements and clears their bindings
-    // before reuse, so it doesn't change results. It keys on `sql.trim()`,
-    // which also strips Unicode whitespace that sqlite itself would reject,
-    // so only text that trimming leaves unchanged goes through it.
+    // prepare_cached keys on trim(), skip weird whitespace
     let prepared = if sql.trim().len() == sql.len() {
         db.prepare_cached(sql).map(Prepared::Cached)
     } else {
@@ -86,15 +75,12 @@ fn prepare<'db>(cancel: &AtomicBool, db: &'db Connection, payload: &[u8]) -> Res
     Ok(stmt)
 }
 
-/// Runs the statement once. Rows it returns are ignored.
 pub fn execute(cancel: &AtomicBool, db: &Connection, payload: &[u8]) -> Result<(), ServiceError> {
     let mut stmt = prepare(cancel, db, payload)?;
     stmt.raw_query().next().map_err(|e| ServiceError::sqlite(&e))?;
     Ok(())
 }
 
-/// Runs the statement and appends every row to `out` as a JSON array of
-/// objects.
 pub fn query(cancel: &AtomicBool, db: &Connection, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ServiceError> {
     let mut stmt = prepare(cancel, db, payload)?;
 

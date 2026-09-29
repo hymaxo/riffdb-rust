@@ -1,9 +1,3 @@
-//! riffdb: a SQLite database served over HTTP.
-//!
-//! One network thread accepts connections and parses requests, a pool of
-//! workers (each with its own SQLite connection) runs the queries and writes
-//! the responses. See docs/ARCHITECTURE.md for the details.
-
 #![forbid(unsafe_code)]
 
 mod channel;
@@ -39,7 +33,7 @@ pub const PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_CLIENTS: u16 = 1024;
 
 fn main() -> ExitCode {
-    // Trace logs are for debug builds only.
+    // trace logs only in debug
     #[cfg(not(debug_assertions))]
     log::set_max_verbosity(log::LogVerbosity::Info);
 

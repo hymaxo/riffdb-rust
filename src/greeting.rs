@@ -1,5 +1,3 @@
-// The startup banner. The "%%" pairs are part of the art, not format escapes.
-
 pub fn greeting() {
     static ASCII: [&str; 18] = [
         "                                    ",

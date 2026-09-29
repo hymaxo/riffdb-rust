@@ -1,4 +1,3 @@
-/// Creates `path` (mode 0755 on Unix) unless it already exists.
 pub fn mkdir_if_not_exists(path: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     let result = {

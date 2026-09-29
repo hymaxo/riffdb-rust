@@ -7,8 +7,6 @@ use crate::request::Request;
 use crate::service::{self, ServiceError};
 
 pub fn query(req: &Request, db: &Connection, res: &mut HttpResponse) {
-    // The rows are written straight into the response buffer, and the
-    // headers are filled in once the length is known.
     match service::query(&req.conn.cancel, db, &req.body, res.begin_body_in_place()) {
         Ok(()) if req.conn.cancel.load(Ordering::SeqCst) => res.zero(),
         Ok(()) => res.finish_body_in_place(200),

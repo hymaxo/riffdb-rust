@@ -1,13 +1,9 @@
-// A fixed set of worker threads, each with its own mailbox. Messages are
-// handed out round-robin.
-
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::channel::Channel;
 
-/// A worker's view of the pool: its own mailbox and the shared `working` flag.
 pub struct ThreadPoolWorker<T> {
     shared: Arc<Shared<T>>,
     index: usize,
@@ -22,7 +18,6 @@ impl<T> ThreadPoolWorker<T> {
         self.shared.working.load(Ordering::SeqCst)
     }
 
-    /// Tells every worker to stop, e.g. when this one can't start.
     pub fn stop_pool(&self) {
         self.shared.working.store(false, Ordering::SeqCst);
     }
@@ -36,7 +31,6 @@ struct Shared<T> {
 pub struct ThreadPool<T> {
     shared: Arc<Shared<T>>,
     workers: Vec<JoinHandle<()>>,
-    // Only touched by the network thread.
     current_worker: AtomicU8,
 }
 
@@ -68,8 +62,6 @@ impl<T: Send + 'static> ThreadPool<T> {
         }
     }
 
-    /// Sends `message` to the next worker in turn. Hands it back if that
-    /// worker's mailbox is full.
     pub fn process(&self, message: T) -> Result<(), T> {
         let index = self.current_worker.load(Ordering::Relaxed) as usize;
         self.current_worker
@@ -77,8 +69,6 @@ impl<T: Send + 'static> ThreadPool<T> {
         self.shared.mailboxes[index].send(message)
     }
 
-    /// Stops the workers and waits for them. Closing the mailboxes wakes the
-    /// ones blocked in recv(); messages still queued are dropped.
     pub fn stop(&mut self) {
         if !self.shared.working.swap(false, Ordering::SeqCst) {
             return;
@@ -128,8 +118,7 @@ mod tests {
         }
         let mut got: Vec<(usize, u32)> = (0..9).map(|_| rx.recv().unwrap()).collect();
         got.sort();
-        // message i went to worker i % 3
         assert!(got.iter().all(|&(w, m)| w == m as usize % 3));
-        pool.stop(); // must not hang
+        pool.stop();
     }
 }

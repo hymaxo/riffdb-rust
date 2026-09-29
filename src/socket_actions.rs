@@ -1,6 +1,3 @@
-// The network thread's side of a connection: read, parse, and hand complete
-// requests to the worker pool.
-
 use std::io::{ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,15 +9,12 @@ use crate::request::{ConnShared, Request};
 use crate::tcp_server::{ReadStatus, TcpServerCallbacks};
 use crate::thread_pool::ThreadPool;
 
-/// Per-client state owned by the network thread.
 pub struct Connection {
     pub parser: HttpParser,
-    /// Write handle + cancel flag, handed to workers with each request.
     pub shared: Arc<ConnShared>,
     fd: u64,
 }
 
-/// The OS socket handle, for the trace logs.
 fn raw_fd(s: &std::net::TcpStream) -> u64 {
     #[cfg(unix)]
     {
@@ -32,8 +26,6 @@ fn raw_fd(s: &std::net::TcpStream) -> u64 {
     }
 }
 
-/// Logs the parser state for a finished request. Only runs with trace
-/// logging on.
 #[cold]
 #[inline(never)]
 fn dump_parser(p: &HttpParser) {
@@ -100,7 +92,7 @@ impl TcpServerCallbacks for SocketActions<'_> {
 
         conn.parser.parse_body(data);
 
-        // Wait for the whole body before dispatching.
+        // wait for the whole body
         if conn.parser.state != ParserState::Complete {
             return status;
         }
@@ -115,7 +107,7 @@ impl TcpServerCallbacks for SocketActions<'_> {
             conn: Arc::clone(&conn.shared),
         };
 
-        // A full mailbox (1024 queued requests) drops the request.
+        // full mailbox = request dropped. TODO: 503?
         let _ = self.pool.process(req);
 
         status
@@ -124,8 +116,6 @@ impl TcpServerCallbacks for SocketActions<'_> {
     fn on_disconnect(&mut self, conn: Connection) {
         log_trace!("Client disconnected: fd={}", conn.fd);
 
-        // Requests still queued or running see this and skip / stop
-        // sending. The socket closes once the last of them is done with it.
         conn.shared.cancel.store(true, Ordering::SeqCst);
     }
 }

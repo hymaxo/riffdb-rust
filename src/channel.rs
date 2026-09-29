@@ -1,7 +1,3 @@
-// A bounded multi-producer queue with blocking receive: a Mutex<Queue<T>>
-// plus a Condvar. Closing it makes recv() return None once it is empty, which
-// is how the thread pool shuts its workers down.
-
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 use crate::queue::Queue;
@@ -31,18 +27,13 @@ impl<T> Channel<T> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Queues `data`, or hands it back if the queue is full.
     pub fn send(&self, data: T) -> Result<(), T> {
         let rc = self.lock().q.enqueue(data);
-        // Notify after unlocking, so the woken receiver doesn't immediately
-        // block on the mutex. recv() re-checks the queue under the lock, so
-        // no wakeup can be lost.
+        // notify after unlock
         self.cond.notify_one();
         rc
     }
 
-    /// Blocks until a message arrives. None once the channel is closed and
-    /// empty.
     pub fn recv(&self) -> Option<T> {
         let mut state = self.lock();
         loop {
@@ -66,7 +57,6 @@ impl<T> Channel<T> {
         self.cond.notify_all();
     }
 
-    /// Removes and returns everything still queued.
     pub fn drain(&self) -> Vec<T> {
         let mut state = self.lock();
         let mut items = Vec::with_capacity(state.q.count() as usize);

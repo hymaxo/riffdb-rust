@@ -11,16 +11,10 @@ use crate::router;
 use crate::thread_pool::ThreadPoolWorker;
 use crate::{log_trace, log_warn};
 
-/// How long a send may make no progress before the response is abandoned.
 const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Shrink the response buffer back after a response larger than this, so
-/// one huge result doesn't pin memory in an idle worker.
 const MAX_IDLE_RESPONSE_CAPACITY: usize = 1 << 20;
 
-/// Writes all of `buf`. The client socket is non-blocking (the network
-/// thread polls it), so a full send buffer means backing off and retrying
-/// until the client disconnects or stops reading for too long.
 fn send_all(client: &TcpStream, mut buf: &[u8], cancel: &AtomicBool) -> std::io::Result<()> {
     let mut stalled_since: Option<Instant> = None;
     let mut spins = 0u32;
@@ -33,6 +27,7 @@ fn send_all(client: &TcpStream, mut buf: &[u8], cancel: &AtomicBool) -> std::io:
                 spins = 0;
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // socket is nonblocking, keep pushing
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 if cancel.load(Ordering::SeqCst) {
                     return Err(ErrorKind::ConnectionAborted.into());
@@ -54,15 +49,12 @@ fn send_all(client: &TcpStream, mut buf: &[u8], cancel: &AtomicBool) -> std::io:
     Ok(())
 }
 
-/// A worker thread's main loop: take requests from the mailbox, run them,
-/// send the responses.
 pub fn run(worker: ThreadPoolWorker<Request>) {
     let Some(db) = database::open() else {
         worker.stop_pool();
         return;
     };
 
-    // One buffer per worker, reused for every request.
     let mut response = HttpResponse::new();
 
     while worker.working() {
@@ -83,7 +75,6 @@ pub fn run(worker: ThreadPoolWorker<Request>) {
             log_trace!("=== end HttpResponse dump ===");
         }
 
-        // Empty when the client disconnected mid-request.
         if response.bytes().is_empty() {
             continue;
         }
@@ -92,6 +83,7 @@ pub fn run(worker: ThreadPoolWorker<Request>) {
             log_warn!("Cant send data to client: {}", e);
         }
 
+        // don't keep 1mb+ buffers forever
         if response.buf.capacity() > MAX_IDLE_RESPONSE_CAPACITY {
             response.buf = Vec::with_capacity(4096);
         }

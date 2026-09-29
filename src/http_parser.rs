@@ -1,10 +1,3 @@
-// Incremental HTTP/1.1 request parser: a byte-at-a-time state machine that
-// can be fed whatever each read() returns.
-//
-// Method, URL and header keys go into fixed buffers and are truncated when
-// too long. Header values grow on demand up to 8191 bytes. Headers past the
-// 24th are ignored. The HTTP version is not checked.
-
 pub const HTTP_PARSER_METHOD_SIZE: usize = 8;
 pub const HTTP_PARSER_URL_SIZE: usize = 64;
 pub const HTTP_PARSER_HEADER_SIZE: usize = 24;
@@ -62,12 +55,8 @@ pub struct HttpParser {
     pub content_length: u32,
 }
 
-/// Parses Content-Length the way `strtoul(s, NULL, 10)` would, cast to u32:
-/// leading whitespace and a sign are allowed (a minus negates in `unsigned
-/// long`), parsing stops at the first non-digit, and overflow saturates at
-/// ULONG_MAX. Existing clients rely on this being lenient.
+// strtoul-like, clients send weird stuff here
 fn strtoul_u32(s: &[u8]) -> u32 {
-    // unsigned long is 32-bit on Windows, 64-bit on LP64 targets.
     #[cfg(windows)]
     type ULong = u32;
     #[cfg(not(windows))]
@@ -127,8 +116,7 @@ impl HttpParser {
         &self.url[..self.url_len as usize]
     }
 
-    /// Looks up Content-Length. Only the exact spellings `Content-Length`
-    /// and `content-length` are recognised.
+    // TODO: ssleert - add check for any method except POST or PUT
     fn set_content_length(&mut self) -> u32 {
         for h in &self.headers[..self.headers_len as usize] {
             if h.key_len == 14 && (h.key() == b"Content-Length" || h.key() == b"content-length") {
@@ -140,7 +128,6 @@ impl HttpParser {
         0
     }
 
-    /// Resets the parser for the next request on the connection.
     pub fn zero(&mut self) {
         self.state = ParserState::Method;
         self.saw_cr = false;
@@ -158,8 +145,6 @@ impl HttpParser {
         self.headers_len = 0;
     }
 
-    /// Feeds the request line and headers. Stops at the end of the headers;
-    /// the body is fed separately with `parse_body`.
     pub fn parse(&mut self, data: &[u8]) {
         if self.state == ParserState::Body {
             return;
@@ -210,8 +195,7 @@ impl HttpParser {
                         self.saw_cr = false;
                         continue;
                     }
-
-                    // the version itself is ignored
+                    // i dont care about version of http
                 }
                 ParserState::HeaderKey => {
                     if byte == b':' {
@@ -220,7 +204,6 @@ impl HttpParser {
                     }
 
                     if byte == b' ' && self.saw_double_dot {
-                        // Past the last slot the header is dropped.
                         if let Some(h) = self.headers.get_mut(self.headers_len as usize) {
                             h.key[h.key_len as usize] = 0;
                         }
@@ -289,17 +272,14 @@ impl HttpParser {
         }
     }
 
-    /// Feeds body bytes from the same buffer that was passed to `parse`.
     pub fn parse_body(&mut self, mut data: &[u8]) {
         if self.state != ParserState::Body {
             return;
         }
 
         if self.body.is_empty() {
+            // body_start only counts for the first chunk
             data = &data[self.body_start as usize..];
-            // body_start is an offset into the buffer that held the end of
-            // the headers. It must only apply to that buffer, not to the next
-            // one when the body arrives in a later read.
             self.body_start = 0;
         }
 
@@ -308,7 +288,7 @@ impl HttpParser {
             self.body.reserve_exact(content_length - self.body.len());
         }
 
-        // Anything past Content-Length (a pipelined request) is not ours.
+        // don't eat the next pipelined request
         let remaining = content_length - self.body.len();
         self.body.extend_from_slice(&data[..data.len().min(remaining)]);
 
@@ -317,8 +297,6 @@ impl HttpParser {
         }
     }
 
-    /// Hands the completed body over (moves it; no copy). The next body is
-    /// allocated when it arrives.
     pub fn take_body(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.body)
     }
@@ -334,7 +312,6 @@ impl Default for HttpParser {
 mod tests {
     use super::*;
 
-    /// Same sequence as `on_readable` for one read().
     fn feed(p: &mut HttpParser, chunk: &[u8]) {
         p.parse(chunk);
         if p.state == ParserState::Body || p.state == ParserState::Complete {
@@ -371,7 +348,6 @@ mod tests {
 
     #[test]
     fn every_split_point_gives_the_same_request() {
-        // Covers headers and body arriving in separate reads.
         for split in 1..POST.len() {
             let mut p = HttpParser::new();
             feed(&mut p, &POST[..split]);
@@ -406,7 +382,6 @@ mod tests {
 
     #[test]
     fn bytes_past_content_length_are_not_copied() {
-        // A pipelined second request must not end up in the body.
         let mut req = POST.to_vec();
         req.extend_from_slice(&[b'Z'; 4096]);
         let mut p = HttpParser::new();
@@ -434,7 +409,7 @@ mod tests {
         let url = format!("/{}", "u".repeat(200));
         let mut p = HttpParser::new();
         feed(&mut p, format!("VERYLONGMETHOD {url} HTTP/1.1\r\n\r\n").as_bytes());
-        assert_eq!(p.method(), b"VERYLON"); // HTTP_PARSER_METHOD_SIZE - 1
+        assert_eq!(p.method(), b"VERYLON");
         assert_eq!(p.url().len(), HTTP_PARSER_URL_SIZE - 1);
         assert_eq!(p.url[HTTP_PARSER_URL_SIZE - 1], 0);
     }
@@ -453,7 +428,7 @@ mod tests {
         assert_eq!(strtoul_u32(b"  \t+42abc"), 42);
         assert_eq!(strtoul_u32(b"abc"), 0);
         assert_eq!(strtoul_u32(b""), 0);
-        assert_eq!(strtoul_u32(b"-1"), u32::MAX); // -(1) in unsigned long
+        assert_eq!(strtoul_u32(b"-1"), u32::MAX);
         assert_eq!(strtoul_u32(b"4294967296"), if cfg!(windows) { u32::MAX } else { 0 });
         assert_eq!(strtoul_u32(b"99999999999999999999999"), u32::MAX);
     }
@@ -473,8 +448,6 @@ mod tests {
 
     #[test]
     fn more_than_twenty_four_headers_are_ignored() {
-        // The extra headers are dropped, and a Content-Length among the first
-        // 24 still works.
         let mut req = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n".to_vec();
         for i in 0..40 {
             req.extend_from_slice(format!("h{i}: v{i}\r\n").as_bytes());

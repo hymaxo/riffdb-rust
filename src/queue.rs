@@ -1,5 +1,3 @@
-// Fixed-size ring buffer.
-
 pub const QUEUE_CAPACITY: usize = 1024;
 
 pub struct Queue<T> {
@@ -28,7 +26,6 @@ impl<T> Queue<T> {
         self.items[self.head as usize].as_ref()
     }
 
-    /// Hands the item back if the queue is full.
     pub fn enqueue(&mut self, data: T) -> Result<(), T> {
         if self.count as usize == QUEUE_CAPACITY {
             return Err(data);
@@ -69,7 +66,6 @@ mod tests {
         let mut q = Queue::new();
         assert!(q.is_empty());
         assert_eq!(q.dequeue(), None);
-        // push/pop enough to wrap head and tail several times
         for round in 0..3 * QUEUE_CAPACITY {
             q.enqueue(round + 1).unwrap();
             q.enqueue(round + 2).unwrap();

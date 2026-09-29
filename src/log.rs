@@ -1,6 +1,3 @@
-// Minimal leveled logger: `log_trace!` ... `log_fatal!` write a timestamped,
-// optionally colored line to stdout (info) or stderr (everything else).
-
 use std::fmt;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -42,13 +39,11 @@ static LOG_COLORED: AtomicBool = AtomicBool::new(true);
 const LOG_ADD_NEW_LINE: bool = true;
 const LOG_ADD_DATE: bool = false;
 
-#[cfg_attr(debug_assertions, allow(dead_code))] // only used in release builds
+#[cfg_attr(debug_assertions, allow(dead_code))]
 pub fn set_max_verbosity(v: LogVerbosity) {
     LOG_MAX_VERBOSITY.store(v as u8, Ordering::Relaxed);
 }
 
-/// Cheap pre-check used by the log macros so that disabled log calls don't
-/// evaluate their arguments.
 #[inline(always)]
 pub fn enabled(verbosity: LogVerbosity) -> bool {
     let max = LOG_MAX_VERBOSITY.load(Ordering::Relaxed);
@@ -122,7 +117,6 @@ pub fn log_flog(
     let prefix_len = string_buffer.len();
     let _ = fmt::write(&mut string_buffer, args);
 
-    // Cap the message part just below LOG_H_BUFSIZE bytes.
     let max = prefix_len + LOG_H_BUFSIZE - 2;
     if string_buffer.len() > max {
         let mut cut = max;

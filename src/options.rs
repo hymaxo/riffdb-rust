@@ -1,12 +1,3 @@
-// Command-line options.
-//
-// A small getopt_long-compatible parser, so the CLI behaves the same on every
-// platform: short options (clustered, attached or separate argument), long
-// options (`--opt val`, `--opt=val`, unambiguous prefixes), and `--`.
-//
-// main() parses once and publishes the result with `set_options`; the rest
-// of the program reads it through `options()`.
-
 use std::sync::OnceLock;
 
 const DEFAULT_PORT: u16 = 9889;
@@ -22,7 +13,6 @@ pub struct Options {
 
 static OPTIONS: OnceLock<Options> = OnceLock::new();
 
-/// The options main() published. Panics if called before `set_options`.
 pub fn options() -> &'static Options {
     OPTIONS.get().expect("options not initialised")
 }
@@ -73,7 +63,6 @@ static LONOPTIONS: [LongOption; 5] = [
 
 const SHORT_OPTIONS: &str = "p:d:t:hv";
 
-/// Returns Some(has_arg) for a known short option.
 fn short_has_arg(c: char) -> Option<bool> {
     if c == ':' {
         return None;
@@ -82,8 +71,6 @@ fn short_has_arg(c: char) -> Option<bool> {
     Some(SHORT_OPTIONS.as_bytes().get(pos + 1) == Some(&b':'))
 }
 
-/// Parses a `-p` / `-t` value: leading whitespace and a sign are allowed,
-/// the rest must be a number within [min, max].
 fn parse_ranged(s: &str, min: i64, max: i64) -> Option<i64> {
     let t = s.trim_start();
     if t.is_empty() {
@@ -268,7 +255,7 @@ mod tests {
         assert_eq!((o.port, o.directory.as_str(), o.threads), (80, "/tmp/x", 4));
         assert!(o.show_help && o.show_version);
 
-        let o = parse(&["--port", "81", "--thr", "2"]).unwrap(); // unambiguous prefix
+        let o = parse(&["--port", "81", "--thr", "2"]).unwrap();
         assert_eq!((o.port, o.threads), (81, 2));
     }
 
@@ -283,6 +270,6 @@ mod tests {
         assert!(parse(&["--nope"]).is_err());
         assert!(parse(&["--help=1"]).is_err());
         assert!(parse(&["stray"]).is_err());
-        assert!(parse(&["--", "-p", "1"]).is_err()); // after -- everything is positional
+        assert!(parse(&["--", "-p", "1"]).is_err());
     }
 }

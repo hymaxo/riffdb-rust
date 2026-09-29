@@ -6,9 +6,6 @@ use crate::query::query;
 use crate::request::Request;
 
 // k&r style shit...
-// Sums the bytes as signed chars up to the first NUL (or the end of the
-// slice). Cheap, but any permutation of a route's characters matches it;
-// existing clients may depend on that, so it stays.
 const fn hash(str: &[u8]) -> u32 {
     let mut hash: u32 = 0;
     let mut i = 0;
@@ -40,9 +37,7 @@ mod tests {
     fn hash_sums_signed_bytes_up_to_nul() {
         assert_eq!(hash(b"/query"), b"/query".iter().map(|&c| c as u32).sum::<u32>());
         assert_eq!(hash(b"/query\0garbage"), QUERY_ROUTE);
-        // bytes >= 0x80 count as negative
         assert_eq!(hash(&[0xff]), (-1i32) as u32);
-        // any permutation collides
         assert_eq!(hash(b"/yreuq"), QUERY_ROUTE);
         assert_ne!(EXECUTE_ROUTE, QUERY_ROUTE);
         assert_ne!(QUERY_ROUTE, HEALTH_ROUTE);
