@@ -1,0 +1,97 @@
+C original:
+  riffdb   cb5b374
+  mimalloc 31d034d
+  wolfssl  09bc4fe
+cpus: 16   conns: 8   secs: 5   rounds: 3
+
+c t=1 health              44922 req/s   p50    171us   p99    295us   body       6 B   errors 0   server yes
+rust t=1 health              45926 req/s   p50    166us   p99    348us   body       6 B   errors 0   server yes
+c t=1 health              44801 req/s   p50    172us   p99    267us   body       6 B   errors 0   server yes
+rust t=1 health              46012 req/s   p50    166us   p99    258us   body       6 B   errors 0   server yes
+c t=1 health              44407 req/s   p50    171us   p99    359us   body       6 B   errors 0   server yes
+rust t=1 health              45767 req/s   p50    167us   p99    302us   body       6 B   errors 0   server yes
+c t=1 query_point         26961 req/s   p50    281us   p99    747us   body      44 B   errors 0   server yes
+rust t=1 query_point         32374 req/s   p50    235us   p99    551us   body      44 B   errors 0   server yes
+c t=1 query_point         27021 req/s   p50    281us   p99    730us   body      44 B   errors 0   server yes
+rust t=1 query_point         32670 req/s   p50    236us   p99    332us   body      44 B   errors 0   server yes
+c t=1 query_point         26759 req/s   p50    281us   p99    754us   body      44 B   errors 0   server yes
+rust t=1 query_point         31959 req/s   p50    236us   p99    638us   body      44 B   errors 0   server yes
+c t=1 query_50            17973 req/s   p50    396us   p99   1301us   body    4477 B   errors 0   server yes
+rust t=1 query_50            22313 req/s   p50    344us   p99    743us   body    4477 B   errors 0   server yes
+c t=1 query_50            18051 req/s   p50    394us   p99   1315us   body    4477 B   errors 0   server yes
+rust t=1 query_50            22268 req/s   p50    346us   p99    537us   body    4477 B   errors 0   server yes
+c t=1 query_50            17749 req/s   p50    398us   p99   1333us   body    4477 B   errors 0   server yes
+rust t=1 query_50            22324 req/s   p50    343us   p99    591us   body    4477 B   errors 0   server yes
+c t=1 query_1000              2 req/s   p50   2826us   p99   3921us   body   93049 B   errors 437   server CRASHED
+      first error: unexpected end of file
+rust t=1 query_1000           3304 req/s   p50   2300us   p99   4181us   body   93049 B   errors 0   server yes
+c t=1 query_1000              2 req/s   p50   2313us   p99   3448us   body   93049 B   errors 436   server CRASHED
+      first error: unexpected end of file
+rust t=1 query_1000           3363 req/s   p50   2284us   p99   3099us   body   93049 B   errors 0   server yes
+c t=1 query_1000              2 req/s   p50   3056us   p99   4173us   body   93049 B   errors 452   server CRASHED
+      first error: unexpected end of file
+rust t=1 query_1000           3384 req/s   p50   2290us   p99   3087us   body   93049 B   errors 0   server yes
+c t=1 execute             26230 req/s   p50    289us   p99    712us   body       2 B   errors 0   server yes
+rust t=1 execute             30704 req/s   p50    248us   p99    612us   body       2 B   errors 0   server yes
+c t=1 execute             26144 req/s   p50    290us   p99    688us   body       2 B   errors 0   server yes
+rust t=1 execute             30931 req/s   p50    248us   p99    361us   body       2 B   errors 0   server yes
+c t=1 execute             26189 req/s   p50    290us   p99    702us   body       2 B   errors 0   server yes
+rust t=1 execute             30466 req/s   p50    248us   p99    651us   body       2 B   errors 0   server yes
+c t=4 health              56397 req/s   p50    137us   p99    253us   body       6 B   errors 2   server yes
+      first error: trailing bytes
+rust t=4 health              58864 req/s   p50    131us   p99    265us   body       6 B   errors 0   server yes
+c t=4 health              55869 req/s   p50    138us   p99    278us   body       6 B   errors 1   server yes
+      first error: trailing bytes
+rust t=4 health              59086 req/s   p50    131us   p99    252us   body       6 B   errors 0   server yes
+c t=4 health              55515 req/s   p50    138us   p99    303us   body       6 B   errors 2   server yes
+      first error: trailing bytes
+rust t=4 health              58869 req/s   p50    132us   p99    231us   body       6 B   errors 0   server yes
+c t=4 query_point         57515 req/s   p50    130us   p99    403us   body      44 B   errors 1   server yes
+      first error: trailing bytes
+rust t=4 query_point         60547 req/s   p50    126us   p99    282us   body      44 B   errors 0   server yes
+c t=4 query_point         56527 req/s   p50    133us   p99    381us   body      44 B   errors 4   server yes
+      first error: trailing bytes
+rust t=4 query_point         60952 req/s   p50    126us   p99    269us   body      44 B   errors 0   server yes
+c t=4 query_point         56773 req/s   p50    132us   p99    394us   body      44 B   errors 1   server yes
+      first error: trailing bytes
+rust t=4 query_point         60556 req/s   p50    126us   p99    294us   body      44 B   errors 0   server yes
+c t=4 query_50            43374 req/s   p50    138us   p99    980us   body    4477 B   errors 2   server yes
+      first error: trailing bytes
+rust t=4 query_50            57783 req/s   p50    131us   p99    360us   body    4477 B   errors 0   server yes
+c t=4 query_50            48462 req/s   p50    137us   p99    991us   body    4477 B   errors 3   server yes
+      first error: trailing bytes
+rust t=4 query_50            56842 req/s   p50    133us   p99    363us   body    4477 B   errors 0   server yes
+c t=4 query_50            48243 req/s   p50    136us   p99    998us   body    4477 B   errors 0   server yes
+rust t=4 query_50            57898 req/s   p50    130us   p99    343us   body    4477 B   errors 0   server yes
+c t=4 query_1000              1 req/s   p50   2977us   p99   5036us   body   93049 B   errors 460   server CRASHED
+      first error: unexpected end of file
+rust t=4 query_1000          11229 req/s   p50    489us   p99   2581us   body   93049 B   errors 0   server yes
+c t=4 query_1000              5 req/s   p50    534us   p99   5065us   body   93049 B   errors 469   server CRASHED
+      first error: unexpected end of file
+rust t=4 query_1000          11301 req/s   p50    457us   p99   2454us   body   93049 B   errors 0   server yes
+c t=4 query_1000              4 req/s   p50    832us   p99   5815us   body   93049 B   errors 494   server CRASHED
+      first error: unexpected end of file
+rust t=4 query_1000          11171 req/s   p50    453us   p99   2562us   body   93049 B   errors 0   server yes
+c t=4 execute             16708 req/s   p50    143us   p99   2881us   body       2 B   errors 0   server yes
+rust t=4 execute             59403 req/s   p50    125us   p99    332us   body       2 B   errors 0   server yes
+c t=4 execute             16738 req/s   p50    142us   p99   2977us   body       2 B   errors 3   server yes
+      first error: trailing bytes
+rust t=4 execute             58317 req/s   p50    126us   p99    380us   body       2 B   errors 0   server yes
+c t=4 execute             16898 req/s   p50    142us   p99   2772us   body       2 B   errors 1   server yes
+      first error: trailing bytes
+rust t=4 execute             58374 req/s   p50    126us   p99    379us   body       2 B   errors 0   server yes
+
+Summary (mean req/s over rounds; p50/p99 are medians, in us; errors summed):
+
+| t   | scenario     | C  req/s  p50/p99                    | Rust  req/s  p50/p99                 | Rust/C |
+|-----|--------------|--------------------------------------|--------------------------------------|--------|
+| 1   | execute      |     26188     290/702                |     30700     248/612                |  1.17x |
+| 1   | health       |     44710     171/295                |     45902     166/302                |  1.03x |
+| 1   | query_1000   |         2    2826/3921    err=1325 crashed=3/3 |      3350    2290/3099               | C died |
+| 1   | query_50     |     17924     396/1315               |     22302     344/591                |  1.24x |
+| 1   | query_point  |     26914     281/747                |     32334     236/551                |  1.20x |
+| 4   | execute      |     16781     142/2881    err=4      |     58698     126/379                |  3.50x |
+| 4   | health       |     55927     138/278     err=5      |     58940     131/252                |  1.05x |
+| 4   | query_1000   |         3     832/5065    err=1423 crashed=3/3 |     11234     457/2562               | C died |
+| 4   | query_50     |     46693     137/991     err=5      |     57508     131/360                |  1.23x |
+| 4   | query_point  |     56938     132/394     err=6      |     60685     126/282                |  1.07x |

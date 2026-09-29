@@ -34,6 +34,11 @@ For code that's hard to see in a whole-server benchmark, time it in isolation wi
 ignored unit test. For example, the JSON writer:
 `cargo test --release --bin riffdb json_micro -- --ignored --nocapture`.
 
+### Against the C original
+
+`compare/` builds the C original and this port in one Linux container and benchmarks
+them alternately. The results and how to run it are in [compare/README.md](../compare/README.md).
+
 ## The safe migration
 
 Here "unsafe" is the last raw-pointer build (commit `1b179b5`) and "safe" is the

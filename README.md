@@ -18,6 +18,9 @@ Endpoints: `POST /execute`, `POST /query` (JSON body `{"q": "...", "args": [...]
   what was optimized and by how much, and the inefficiencies found in the C code.
 - [docs/MIGRATION.md](docs/MIGRATION.md): how the unsafe port became safe, and what
   replaced each unsafe construct.
+- [compare/](compare/README.md): a benchmark against the C original, with both built in one
+  Linux container. Networking is at parity, queries are 1.1–1.25× faster, writes 2.8–3.5×
+  faster, and the port has no errors where C crashes or corrupts responses.
 
 ## Architecture (same as C)
 

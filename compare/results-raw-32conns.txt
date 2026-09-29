@@ -1,0 +1,37 @@
+C original:
+  riffdb   cb5b374
+  mimalloc 31d034d
+  wolfssl  09bc4fe
+cpus: 16   conns: 32   secs: 4   rounds: 2
+
+c t=4 health             161406 req/s   p50    157us   p99    658us   body       6 B   errors 9   server yes
+      first error: trailing bytes
+rust t=4 health             162380 req/s   p50    155us   p99    694us   body       6 B   errors 0   server yes
+c t=4 health             149700 req/s   p50    170us   p99    720us   body       6 B   errors 16   server yes
+      first error: trailing bytes
+rust t=4 health             145919 req/s   p50    171us   p99    751us   body       6 B   errors 0   server yes
+c t=4 query_point         90190 req/s   p50    266us   p99   1180us   body      44 B   errors 3   server yes
+      first error: trailing bytes
+rust t=4 query_point        101231 req/s   p50    257us   p99    936us   body      44 B   errors 0   server yes
+c t=4 query_point         90496 req/s   p50    260us   p99   1164us   body      44 B   errors 4   server yes
+      first error: trailing bytes
+rust t=4 query_point        102978 req/s   p50    244us   p99    912us   body      44 B   errors 0   server yes
+c t=4 query_50            58216 req/s   p50    405us   p99   1971us   body    4477 B   errors 2   server yes
+      first error: trailing bytes
+rust t=4 query_50            71922 req/s   p50    331us   p99   1428us   body    4477 B   errors 0   server yes
+c t=4 query_50            60571 req/s   p50    376us   p99   1874us   body    4477 B   errors 1   server yes
+      first error: Resource temporarily unavailable (os error 11)
+rust t=4 query_50            70960 req/s   p50    319us   p99   1578us   body    4477 B   errors 0   server yes
+c t=4 execute             25216 req/s   p50    835us   p99   7141us   body       2 B   errors 0   server yes
+rust t=4 execute             70562 req/s   p50    355us   p99   1377us   body       2 B   errors 0   server yes
+c t=4 execute             25638 req/s   p50    845us   p99   6459us   body       2 B   errors 0   server yes
+rust t=4 execute             70461 req/s   p50    362us   p99   1391us   body       2 B   errors 0   server yes
+
+Summary (mean req/s over rounds; p50/p99 are medians, in us; errors summed):
+
+| t   | scenario     | C  req/s  p50/p99                    | Rust  req/s  p50/p99                 | Rust/C |
+|-----|--------------|--------------------------------------|--------------------------------------|--------|
+| 4   | execute      |     25427     835/6459               |     70512     355/1377               |  2.77x |
+| 4   | health       |    155553     157/658     err=25     |    154150     155/694                |  0.99x |
+| 4   | query_50     |     59394     376/1874    err=3      |     71441     319/1428               |  1.20x |
+| 4   | query_point  |     90343     260/1164    err=7      |    102104     244/912                |  1.13x |
