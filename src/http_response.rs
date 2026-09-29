@@ -1,11 +1,9 @@
-// Port of HttpResponse.h / HttpResponse.c
-
 pub const HTTP_RESPONSE_BUFFER_CAPACITY: usize = 4096;
 
 const HTTP_PROTOCOL_STR: &[u8] = b"HTTP/1.1 ";
 
-/// Formats `v` in decimal into the tail of `buf` and returns the digits
-/// (what C does with sprintf("%d") into a stack buffer).
+/// Formats `v` in decimal into the tail of `buf` and returns the digits,
+/// without going through `core::fmt` or the heap.
 #[inline]
 pub fn fmt_u64(mut v: u64, buf: &mut [u8; 20]) -> &[u8] {
     let mut i = buf.len();
@@ -31,7 +29,6 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
-    /// HttpResponseInit
     pub fn new() -> HttpResponse {
         HttpResponse {
             buf: Vec::with_capacity(HTTP_RESPONSE_BUFFER_CAPACITY),
@@ -39,7 +36,6 @@ impl HttpResponse {
         }
     }
 
-    /// HttpResponseZero
     pub fn zero(&mut self) {
         self.buf.clear();
         self.start = 0;
@@ -52,10 +48,8 @@ impl HttpResponse {
 
     /// Starts a body that is written straight into `buf` (append to the
     /// returned Vec), for when its length isn't known up front. Finish with
-    /// `finish_body_in_place`, or `zero()` to abandon it.
-    ///
-    /// Not in C: /query built its JSON in a separate buffer and copied it
-    /// into the response (yyjson output -> HttpResponseBody).
+    /// `finish_body_in_place`, or `zero()` to abandon it. This saves copying
+    /// large query results from a scratch buffer into the response.
     pub fn begin_body_in_place(&mut self) -> &mut Vec<u8> {
         self.buf.clear();
         self.buf.resize(HEAD_ROOM, 0);
@@ -84,7 +78,6 @@ impl HttpResponse {
         self.buf[self.start..HEAD_ROOM].copy_from_slice(&head[..n]);
     }
 
-    /// HttpResponseStatusCode
     pub fn status_code(&mut self, status: u16) {
         let mut digits = [0u8; 20];
         self.buf.extend_from_slice(HTTP_PROTOCOL_STR);
@@ -92,27 +85,22 @@ impl HttpResponse {
         self.buf.extend_from_slice(b"\r\n");
     }
 
-    /// HttpResponseHeader
-    #[allow(dead_code)] // C API; body() writes its one header inline
-    pub fn header(&mut self, key: &[u8], value: &[u8]) {
-        self.buf.extend_from_slice(key);
-        self.buf.extend_from_slice(b": ");
-        self.buf.extend_from_slice(value);
-        self.buf.extend_from_slice(b"\r\n");
-    }
-
-    /// HttpResponseBody
+    /// Writes Content-Length and the body. Call after `status_code`.
     pub fn body(&mut self, body: &[u8]) {
         let mut digits = [0u8; 20];
         let len_str = fmt_u64(body.len() as u64, &mut digits);
 
-        // Grow once for the rest of the response instead of per append
-        // (C: HttpResponseAppend doubles per call).
+        // Grow once for the rest of the response instead of per append.
         self.buf.reserve(16 + len_str.len() + 4 + body.len());
         self.buf.extend_from_slice(b"Content-Length: ");
         self.buf.extend_from_slice(len_str);
         self.buf.extend_from_slice(b"\r\n\r\n");
         self.buf.extend_from_slice(body);
+    }
+
+    pub fn status_and_body(&mut self, status: u16, body: &[u8]) {
+        self.status_code(status);
+        self.body(body);
     }
 }
 
@@ -135,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_format_matches_c() {
+    fn wire_format() {
         let mut r = HttpResponse::new();
 
         r.status_code(200);
@@ -147,7 +135,7 @@ mod tests {
         r.body(b"");
         assert_eq!(r.buf, b"HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n");
 
-        // Larger than two doublings of the initial capacity (PORT FIX 1).
+        // Much larger than the initial capacity.
         r.zero();
         let big = vec![b'x'; 100_000];
         r.status_code(200);
@@ -155,10 +143,6 @@ mod tests {
         let head = b"HTTP/1.1 200\r\nContent-Length: 100000\r\n\r\n";
         assert_eq!(&r.buf[..head.len()], head);
         assert_eq!(r.buf.len(), head.len() + 100_000);
-
-        r.zero();
-        r.header(b"X-Test", b"1");
-        assert_eq!(r.buf, b"X-Test: 1\r\n");
     }
 
     #[test]

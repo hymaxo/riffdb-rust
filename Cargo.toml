@@ -3,18 +3,18 @@ name = "riffdb"
 version = "0.0.1"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Rust port of riffdb - sqlite over http"
+description = "SQLite over HTTP: a small, fast database server"
 
 [dependencies]
-# Bundled sqlite via libsqlite3-sys; the C build's compile flags are passed
-# through LIBSQLITE3_FLAGS in .cargo/config.toml.
+# Bundled sqlite; its compile flags are set through LIBSQLITE3_FLAGS in
+# .cargo/config.toml.
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = "1"
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# poll() loop of TcpServer.c
+# event loop
 mio = { version = "1", features = ["os-poll", "net"] }
-# listening socket options (SO_REUSEADDR / SO_REUSEPORT / backlog) like TcpServerCreate
+# listening socket options (SO_REUSEADDR / SO_REUSEPORT / backlog)
 socket2 = { version = "0.5", features = ["all"] }
 
 [profile.release]

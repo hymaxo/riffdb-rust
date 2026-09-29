@@ -1,5 +1,3 @@
-// Port of Router.h / Router.c
-
 use rusqlite::Connection;
 
 use crate::execute::execute;
@@ -8,8 +6,9 @@ use crate::query::query;
 use crate::request::Request;
 
 // k&r style shit...
-// Sums the chars (signed, as `char` is in C on x86) up to the first NUL, or
-// the end of the slice. The NUL itself adds 0, so it is simply not counted.
+// Sums the bytes as signed chars up to the first NUL (or the end of the
+// slice). Cheap, but any permutation of a route's characters matches it;
+// existing clients may depend on that, so it stays.
 const fn hash(str: &[u8]) -> u32 {
     let mut hash: u32 = 0;
     let mut i = 0;
@@ -20,31 +19,17 @@ const fn hash(str: &[u8]) -> u32 {
     hash
 }
 
-// C computed these at startup in RouterInit(); here they are compile-time.
 const EXECUTE_ROUTE: u32 = hash(b"/execute");
 const QUERY_ROUTE: u32 = hash(b"/query");
 const HEALTH_ROUTE: u32 = hash(b"/health");
 
-pub fn router_route(req: &Request, db: &Connection, res: &mut HttpResponse) {
-    // C hashes Parser.Url as a C string: the whole array up to its NUL.
-    let route = hash(&req.url);
-
-    if route == EXECUTE_ROUTE {
-        execute(req, db, res);
-        return;
+pub fn route(req: &Request, db: &Connection, res: &mut HttpResponse) {
+    match hash(&req.url) {
+        EXECUTE_ROUTE => execute(req, db, res),
+        QUERY_ROUTE => query(req, db, res),
+        HEALTH_ROUTE => res.status_and_body(200, b"health"),
+        _ => res.status_and_body(404, b"not found"),
     }
-    if route == QUERY_ROUTE {
-        query(req, db, res);
-        return;
-    }
-    if route == HEALTH_ROUTE {
-        res.status_code(200);
-        res.body(b"health");
-        return;
-    }
-
-    res.status_code(404);
-    res.body(b"not found");
 }
 
 #[cfg(test)]
@@ -52,13 +37,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hash_matches_c_semantics() {
+    fn hash_sums_signed_bytes_up_to_nul() {
         assert_eq!(hash(b"/query"), b"/query".iter().map(|&c| c as u32).sum::<u32>());
-        // stops at NUL, like the C loop over a C string
         assert_eq!(hash(b"/query\0garbage"), QUERY_ROUTE);
-        // signed char: bytes >= 0x80 subtract
+        // bytes >= 0x80 count as negative
         assert_eq!(hash(&[0xff]), (-1i32) as u32);
-        // known collision in the original scheme: any permutation matches
+        // any permutation collides
         assert_eq!(hash(b"/yreuq"), QUERY_ROUTE);
         assert_ne!(EXECUTE_ROUTE, QUERY_ROUTE);
         assert_ne!(QUERY_ROUTE, HEALTH_ROUTE);

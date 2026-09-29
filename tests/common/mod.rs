@@ -21,7 +21,7 @@ pub struct Server {
 }
 
 impl Server {
-    /// One worker thread, like `.vscode/launch.json` (`-t 1`). Per-connection
+    /// One worker thread. Per-connection
     /// state such as `PRAGMA foreign_keys` only sticks with a single worker,
     /// since requests are dispatched round-robin across worker connections.
     pub fn start() -> Server {
@@ -35,7 +35,7 @@ impl Server {
         let _ = std::fs::remove_dir_all(&dir);
 
         // RIFFDB_BIN lets the same suite run against another build (an older
-        // version, a profiling build, or the C server).
+        // version, a profiling build, or another implementation).
         let bin = std::env::var_os("RIFFDB_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_riffdb").into());
 
         // If the port turns out to be taken, the server exits at startup
@@ -161,7 +161,7 @@ pub fn http(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
-/// Port of the riffdb.js client. `sql` and `exec` both POST to /query,
+/// A minimal version of the riffdb.js client. `sql` and `exec` both POST to /query,
 /// exactly like connection.ts; `exec` ignores the result.
 #[derive(Clone, Copy)]
 pub struct Db {

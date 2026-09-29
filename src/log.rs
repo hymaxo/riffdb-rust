@@ -1,8 +1,5 @@
-// Port of Log.h / Log.c
-//
-// The C version takes a `FILE*` and a printf format string. Here the stream is
-// an enum and the message is a pre-built `fmt::Arguments` (the macros below
-// play the role of the LogTrace/LogInfo/... preprocessor macros).
+// Minimal leveled logger: `log_trace!` ... `log_fatal!` write a timestamped,
+// optionally colored line to stdout (info) or stderr (everything else).
 
 use std::fmt;
 use std::io::Write;
@@ -20,8 +17,6 @@ pub enum LogVerbosity {
     Error = 4,
     Fatal = 5,
 }
-
-pub const LOG_VERBOSITY_LEN: u8 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
@@ -42,11 +37,10 @@ impl LogVerbosity {
     }
 }
 
-// C globals (LogMaxVerbosity, LogColored, ...) as atomics.
 static LOG_MAX_VERBOSITY: AtomicU8 = AtomicU8::new(LogVerbosity::Trace as u8);
 static LOG_COLORED: AtomicBool = AtomicBool::new(true);
-static LOG_ADD_NEW_LINE: AtomicBool = AtomicBool::new(true);
-static LOG_ADD_DATE: AtomicBool = AtomicBool::new(false);
+const LOG_ADD_NEW_LINE: bool = true;
+const LOG_ADD_DATE: bool = false;
 
 #[cfg_attr(debug_assertions, allow(dead_code))] // only used in release builds
 pub fn set_max_verbosity(v: LogVerbosity) {
@@ -54,8 +48,7 @@ pub fn set_max_verbosity(v: LogVerbosity) {
 }
 
 /// Cheap pre-check used by the log macros so that disabled log calls don't
-/// evaluate their arguments (LogFlog in C checks inside, but its arguments
-/// are just pointers/ints, so there it costs nothing).
+/// evaluate their arguments.
 #[inline(always)]
 pub fn enabled(verbosity: LogVerbosity) -> bool {
     let max = LOG_MAX_VERBOSITY.load(Ordering::Relaxed);
@@ -93,8 +86,6 @@ pub fn log_flog(
     filename: &str,
     args: fmt::Arguments,
 ) {
-    debug_assert!((verbosity as u8) <= LOG_VERBOSITY_LEN);
-
     let max_verbosity = LogVerbosity::from_u8(LOG_MAX_VERBOSITY.load(Ordering::Relaxed));
     if max_verbosity == LogVerbosity::None || verbosity == LogVerbosity::None {
         return;
@@ -103,11 +94,10 @@ pub fn log_flog(
         return;
     }
 
-    // stdout/stderr are the only streams here, so this is always LogColored.
     let local_log_colored = LOG_COLORED.load(Ordering::Relaxed);
 
     let now = chrono::Local::now();
-    let time_buffer = if LOG_ADD_DATE.load(Ordering::Relaxed) {
+    let time_buffer = if LOG_ADD_DATE {
         now.format("%Y-%m-%d %H:%M:%S")
     } else {
         now.format("%H:%M:%S")
@@ -132,7 +122,7 @@ pub fn log_flog(
     let prefix_len = string_buffer.len();
     let _ = fmt::write(&mut string_buffer, args);
 
-    // vsnprintf(StringPointer, LOG_H_BUFSIZE - 1, ...) truncation
+    // Cap the message part just below LOG_H_BUFSIZE bytes.
     let max = prefix_len + LOG_H_BUFSIZE - 2;
     if string_buffer.len() > max {
         let mut cut = max;
@@ -142,7 +132,7 @@ pub fn log_flog(
         string_buffer.truncate(cut);
     }
 
-    if LOG_ADD_NEW_LINE.load(Ordering::Relaxed) {
+    if LOG_ADD_NEW_LINE {
         string_buffer.push('\n');
     }
 

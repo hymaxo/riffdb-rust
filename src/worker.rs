@@ -1,25 +1,27 @@
-// Port of Worker.h / Worker.c
-
 use std::io::{ErrorKind, Write};
 use std::net::TcpStream;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::database::database_open;
+use crate::database;
 use crate::http_response::HttpResponse;
 use crate::log::{self, LogVerbosity};
 use crate::request::Request;
-use crate::router::router_route;
+use crate::router;
 use crate::thread_pool::ThreadPoolWorker;
 use crate::{log_trace, log_warn};
 
 /// How long a send may make no progress before the response is abandoned.
 const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// C calls send() once and ignores short writes, so large responses on a
-/// full socket buffer get truncated. The client socket is non-blocking
-/// (shared with the poll loop), so on EWOULDBLOCK back off and retry.
-fn send_all(client: &TcpStream, mut buf: &[u8], req: &Request) -> std::io::Result<()> {
+/// Shrink the response buffer back after a response larger than this, so
+/// one huge result doesn't pin memory in an idle worker.
+const MAX_IDLE_RESPONSE_CAPACITY: usize = 1 << 20;
+
+/// Writes all of `buf`. The client socket is non-blocking (the network
+/// thread polls it), so a full send buffer means backing off and retrying
+/// until the client disconnects or stops reading for too long.
+fn send_all(client: &TcpStream, mut buf: &[u8], cancel: &AtomicBool) -> std::io::Result<()> {
     let mut stalled_since: Option<Instant> = None;
     let mut spins = 0u32;
     while !buf.is_empty() {
@@ -32,7 +34,7 @@ fn send_all(client: &TcpStream, mut buf: &[u8], req: &Request) -> std::io::Resul
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                if req.conn.cancel.load(Ordering::SeqCst) {
+                if cancel.load(Ordering::SeqCst) {
                     return Err(ErrorKind::ConnectionAborted.into());
                 }
                 let since = *stalled_since.get_or_insert_with(Instant::now);
@@ -52,18 +54,19 @@ fn send_all(client: &TcpStream, mut buf: &[u8], req: &Request) -> std::io::Resul
     Ok(())
 }
 
-pub fn worker_handler(self_: ThreadPoolWorker<Request>) -> i32 {
-    let Some(db) = database_open(false) else {
-        self_.stop_pool();
-        return 0;
+/// A worker thread's main loop: take requests from the mailbox, run them,
+/// send the responses.
+pub fn run(worker: ThreadPoolWorker<Request>) {
+    let Some(db) = database::open() else {
+        worker.stop_pool();
+        return;
     };
 
-    // Reused for every request (C: per-connection response buffer inside
-    // Request, yyjson buffers per query).
+    // One buffer per worker, reused for every request.
     let mut response = HttpResponse::new();
 
-    while self_.working() {
-        let Some(req) = self_.mail_box().recv() else {
+    while worker.working() {
+        let Some(req) = worker.mailbox().recv() else {
             break;
         };
         if req.conn.cancel.load(Ordering::SeqCst) {
@@ -71,11 +74,8 @@ pub fn worker_handler(self_: ThreadPoolWorker<Request>) -> i32 {
             continue;
         }
 
-        // C zeroes the response after send(); see the PORT FIX in the direct
-        // port. With a buffer per worker it doesn't matter, but reset first.
         response.zero();
-
-        router_route(&req, &db, &mut response);
+        router::route(&req, &db, &mut response);
 
         if log::enabled(LogVerbosity::Trace) {
             log_trace!("=== HttpResponse dump ===");
@@ -83,20 +83,17 @@ pub fn worker_handler(self_: ThreadPoolWorker<Request>) -> i32 {
             log_trace!("=== end HttpResponse dump ===");
         }
 
-        // Cancelled mid-request: C sends the (empty) response anyway.
+        // Empty when the client disconnected mid-request.
         if response.bytes().is_empty() {
             continue;
         }
 
-        if let Err(e) = send_all(&req.conn.client, response.bytes(), &req) {
-            log_warn!("Cant send data to client: Rc = -1, errno = {}", e.raw_os_error().unwrap_or(0));
+        if let Err(e) = send_all(&req.conn.client, response.bytes(), &req.conn.cancel) {
+            log_warn!("Cant send data to client: {}", e);
         }
 
-        // Don't let one huge result pin memory in an idle worker.
-        if response.buf.capacity() > 1 << 20 {
+        if response.buf.capacity() > MAX_IDLE_RESPONSE_CAPACITY {
             response.buf = Vec::with_capacity(4096);
         }
     }
-
-    0
 }

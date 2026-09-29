@@ -1,4 +1,5 @@
-// Port of packages/riffdb.js/mod_test.ts
+// The riffdb.js client test suite (packages/riffdb.js/mod_test.ts in
+// ssleert/riffdb), run against this server.
 //
 // Differences from the Deno suite:
 // - Every test gets its own server + database (Deno ran them sequentially
@@ -391,7 +392,7 @@ fn null_handling() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "fails against the C server too: JSON.stringify(Uint8Array) sends an object, \
+#[ignore = "broken upstream too: JSON.stringify(Uint8Array) sends an object, \
             which riffdb skips when binding, and BLOB columns are returned as null"]
 fn blob_round_trip() {
     let s = Server::start();
@@ -680,7 +681,7 @@ fn concurrent_updates_on_same_row() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "fails against the C server too: the JS test interpolates the VALUES list \
+#[ignore = "broken upstream too: the JS test interpolates the VALUES list \
             as a bound parameter (`VALUES ?`), which is a SQL syntax error"]
 fn large_batch_insert() {
     let s = Server::start();

@@ -1,12 +1,6 @@
-// Port of Channel.h / Channel.c
-//
-// C11 mtx_t/cnd_t + Queue become a Mutex<Queue<T>> + Condvar.
-//
-// Addition over C: `close()`. ChannelRecv in C blocks forever, so
-// ThreadPoolStop could never join its workers. A closed channel makes recv()
-// return None once it is empty.
-
-#![allow(dead_code)]
+// A bounded multi-producer queue with blocking receive: a Mutex<Queue<T>>
+// plus a Condvar. Closing it makes recv() return None once it is empty, which
+// is how the thread pool shuts its workers down.
 
 use std::sync::{Condvar, Mutex, MutexGuard};
 
@@ -37,14 +31,12 @@ impl<T> Channel<T> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Like ChannelSend. A full queue drops the message (C: Enqueue on a full
-    /// queue returns without storing it); it's handed back so the caller can
-    /// see that.
+    /// Queues `data`, or hands it back if the queue is full.
     pub fn send(&self, data: T) -> Result<(), T> {
         let rc = self.lock().q.enqueue(data);
-        // Notify after unlocking (C signals while holding the mutex, so the
-        // woken worker immediately blocks on it again). recv() re-checks the
-        // queue under the lock, so no wakeup can be lost.
+        // Notify after unlocking, so the woken receiver doesn't immediately
+        // block on the mutex. recv() re-checks the queue under the lock, so
+        // no wakeup can be lost.
         self.cond.notify_one();
         rc
     }
@@ -64,6 +56,7 @@ impl<T> Channel<T> {
         }
     }
 
+    #[cfg(test)]
     pub fn try_recv(&self) -> Option<T> {
         self.lock().q.dequeue()
     }
@@ -73,8 +66,7 @@ impl<T> Channel<T> {
         self.cond.notify_all();
     }
 
-    /// Removes and returns everything still queued (C: ChannelDestroy frees
-    /// them).
+    /// Removes and returns everything still queued.
     pub fn drain(&self) -> Vec<T> {
         let mut state = self.lock();
         let mut items = Vec::with_capacity(state.q.count() as usize);

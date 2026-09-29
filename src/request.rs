@@ -1,14 +1,9 @@
-// Port of Request.h
+// A complete request, as handed from the network thread to a worker.
 //
-// In C one heap `Request` per connection holds the parser, the response
-// buffer and the worker's db handle, and is shared between the network
-// thread and a worker through a raw pointer. Here it is split by owner:
-//
-// - `Connection` (socket_actions.rs) stays with the network thread and owns
-//   the parser.
-// - `Request` (this file) is what a worker receives: everything about one
-//   complete request, moved out of the parser, plus a handle to write the
-//   response to. The worker keeps its own response buffer and db.
+// Connection state is split by owner: the network thread keeps the parser
+// (`Connection` in socket_actions.rs), and each finished request is moved to
+// a worker together with a shared handle to the socket. Workers keep their
+// own response buffer and database connection.
 
 use std::net::TcpStream;
 use std::sync::atomic::AtomicBool;
@@ -17,9 +12,10 @@ use std::sync::Arc;
 use crate::http_parser::HTTP_PARSER_URL_SIZE;
 
 pub struct Request {
-    /// Parser.Url as-is: NUL-terminated, the router hashes it like a C string.
+    /// The URL buffer from the parser, NUL-terminated. The router hashes it
+    /// up to the NUL.
     pub url: [u8; HTTP_PARSER_URL_SIZE],
-    /// Exactly Content-Length bytes (C: Parser.Body / Parser.ContentLength).
+    /// Exactly Content-Length bytes.
     pub body: Vec<u8>,
 
     /// Shared with the connection (one Arc, so one refcount bump per request).
@@ -28,8 +24,8 @@ pub struct Request {
 
 /// The parts of a connection a worker needs.
 pub struct ConnShared {
-    /// Where the response goes (C: Req->ClientFd).
+    /// Where the response goes.
     pub client: TcpStream,
-    /// Set by the network thread when the client disconnects (C: Req->Cancel).
+    /// Set by the network thread when the client disconnects.
     pub cancel: AtomicBool,
 }

@@ -1,4 +1,5 @@
-// Port of Service.h / Service.c
+// The /query and /execute logic: parse the payload, prepare and bind the
+// statement, run it.
 
 use rusqlite::{CachedStatement, Connection, Statement};
 use std::borrow::Cow;
@@ -6,189 +7,101 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::database::sqlite_errmsg;
-use crate::protocol::{protocol_bind_json_args_to_stmt, protocol_json_from_stmt, protocol_parse_payload, JsonWriter};
+use crate::protocol::{bind_args, parse_payload, write_rows, JsonWriter};
 
-pub type ServiceError = i32;
-pub const SERVICE_OK: ServiceError = 0;
-pub const SERVICE_ERROR_INCORRECT_JSON: ServiceError = -1;
-pub const SERVICE_ERROR_QUERY_EMPTY: ServiceError = -2;
-pub const SERVICE_ERROR_QUERY_LEN: ServiceError = -3;
-pub const SERVICE_ERROR_PROTOCOL: ServiceError = -4;
-pub const SERVICE_ERROR_SQLITE: ServiceError = -5;
-pub const SERVICE_ERROR_CANT_CREATE_JSON: ServiceError = -6;
-pub const SERVICE_ERROR_CANCEL: ServiceError = -7;
-
-/// What `Res`/`ResSize` point at in C.
-pub enum ServiceRes {
-    /// A fixed or error message (C: string literal or strdup'd errmsg).
-    Msg(Cow<'static, str>),
-    /// The /query JSON, in `ServiceState::json_buf`.
-    Json,
+#[derive(Debug)]
+pub enum ServiceError {
+    /// The client went away; nothing should be sent.
+    Cancelled,
+    /// Answered with a 500 and this message as the body.
+    Failed(Cow<'static, str>),
 }
 
-pub struct ServiceState<'a> {
-    pub cancel: &'a AtomicBool,
-    pub db: &'a Connection,
-    pub payload: &'a [u8],
-
-    pub res: ServiceRes,
-    pub status: u16,
-
-    /// Where /query appends its JSON: the worker's response buffer (C: a
-    /// fresh yyjson doc + output buffer per query, leaked).
-    pub json_buf: &'a mut Vec<u8>,
-}
-
-impl<'a> ServiceState<'a> {
-    pub fn new(cancel: &'a AtomicBool, db: &'a Connection, payload: &'a [u8], json_buf: &'a mut Vec<u8>) -> Self {
-        ServiceState {
-            cancel,
-            db,
-            payload,
-            res: ServiceRes::Msg(Cow::Borrowed("")),
-            status: 0,
-            json_buf,
-        }
-    }
-
-    /// Res[0..ResSize]
-    pub fn res(&self) -> &[u8] {
-        match &self.res {
-            ServiceRes::Msg(m) => m.as_bytes(),
-            ServiceRes::Json => self.json_buf,
-        }
+impl ServiceError {
+    fn sqlite(e: &rusqlite::Error) -> ServiceError {
+        ServiceError::Failed(Cow::Owned(sqlite_errmsg(e)))
     }
 }
 
 /// A statement from the connection's cache, or a one-off one.
-enum Cached<'db> {
-    Hit(CachedStatement<'db>),
+enum Prepared<'db> {
+    Cached(CachedStatement<'db>),
     Fresh(Statement<'db>),
 }
 
-impl<'db> Deref for Cached<'db> {
+impl<'db> Deref for Prepared<'db> {
     type Target = Statement<'db>;
     #[inline]
     fn deref(&self) -> &Statement<'db> {
         match self {
-            Cached::Hit(s) => s,
-            Cached::Fresh(s) => s,
+            Prepared::Cached(s) => s,
+            Prepared::Fresh(s) => s,
         }
     }
 }
 
-impl<'db> DerefMut for Cached<'db> {
+impl<'db> DerefMut for Prepared<'db> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Statement<'db> {
         match self {
-            Cached::Hit(s) => s,
-            Cached::Fresh(s) => s,
+            Prepared::Cached(s) => s,
+            Prepared::Fresh(s) => s,
         }
     }
 }
 
-#[inline]
-fn prepare<'db>(
-    cancel: &AtomicBool,
-    err: &mut ServiceRes,
-    payload: &[u8],
-    db: &'db Connection,
-) -> Result<Cached<'db>, ServiceError> {
+fn prepare<'db>(cancel: &AtomicBool, db: &'db Connection, payload: &[u8]) -> Result<Prepared<'db>, ServiceError> {
     if cancel.load(Ordering::SeqCst) {
-        return Err(SERVICE_ERROR_CANCEL);
+        return Err(ServiceError::Cancelled);
     }
-    let Ok(doc) = protocol_parse_payload(payload) else {
-        // (sic) message kept from the original
-        *err = ServiceRes::Msg(Cow::Borrowed("query len < 3"));
-        return Err(SERVICE_ERROR_INCORRECT_JSON);
+    // Clients match on these messages, so they stay as they are, including
+    // the odd one for invalid JSON.
+    let Ok(doc) = parse_payload(payload) else {
+        return Err(ServiceError::Failed(Cow::Borrowed("query len < 3")));
     };
-
-    let Some(query_obj) = doc.q else {
-        *err = ServiceRes::Msg(Cow::Borrowed("query is empty"));
-        return Err(SERVICE_ERROR_QUERY_EMPTY);
+    let Some(q) = doc.q else {
+        return Err(ServiceError::Failed(Cow::Borrowed("query is empty")));
     };
-
-    // yyjson_get_str / yyjson_get_len on a non-string yield NULL / 0
-    let query: &str = query_obj.as_deref().unwrap_or("");
-    if query.len() < 3 {
-        *err = ServiceRes::Msg(Cow::Borrowed("query len < 3"));
-        return Err(SERVICE_ERROR_QUERY_LEN);
+    // A non-string "q" counts as an empty string.
+    let sql: &str = q.as_deref().unwrap_or("");
+    if sql.len() < 3 {
+        return Err(ServiceError::Failed(Cow::Borrowed("query len < 3")));
     }
 
-    // C re-prepares on every request (C-7). The per-connection statement
-    // cache is behaviour-neutral: rusqlite resets the statement (Rows drop)
-    // and clears its bindings before reuse. It keys on `sql.trim()`, which
-    // strips Unicode whitespace sqlite would reject, so only exactly-trimmed
-    // text goes through it.
-    let prepared = if query.trim().len() == query.len() {
-        db.prepare_cached(query).map(Cached::Hit)
+    // rusqlite's statement cache resets statements and clears their bindings
+    // before reuse, so it doesn't change results. It keys on `sql.trim()`,
+    // which also strips Unicode whitespace that sqlite itself would reject,
+    // so only text that trimming leaves unchanged goes through it.
+    let prepared = if sql.trim().len() == sql.len() {
+        db.prepare_cached(sql).map(Prepared::Cached)
     } else {
-        db.prepare(query).map(Cached::Fresh)
+        db.prepare(sql).map(Prepared::Fresh)
     };
-    let mut stmt = match prepared {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            *err = ServiceRes::Msg(Cow::Owned(sqlite_errmsg(&e)));
-            return Err(SERVICE_ERROR_SQLITE);
-        }
-    };
+    let mut stmt = prepared.map_err(|e| ServiceError::sqlite(&e))?;
 
     if let Some(args) = &doc.args {
-        if !args.is_empty() && protocol_bind_json_args_to_stmt(args, &mut stmt) != 0 {
-            return Err(SERVICE_ERROR_PROTOCOL);
-        }
+        bind_args(args, &mut stmt);
     }
 
     Ok(stmt)
 }
 
-pub fn service_execute(self_: &mut ServiceState) -> ServiceError {
-    let ret = 'body: {
-        let mut stmt = match prepare(self_.cancel, &mut self_.res, self_.payload, self_.db) {
-            Ok(stmt) => stmt,
-            Err(ret) => break 'body ret,
-        };
-
-        // One sqlite3_step: SQLITE_ROW or SQLITE_DONE are both fine.
-        if let Err(e) = stmt.raw_query().next() {
-            self_.res = ServiceRes::Msg(Cow::Owned(sqlite_errmsg(&e)));
-            break 'body SERVICE_ERROR_SQLITE;
-        }
-
-        self_.status = 200;
-        self_.res = ServiceRes::Msg(Cow::Borrowed("ok"));
-        return SERVICE_OK;
-    };
-
-    // cleanup:
-    self_.status = 500;
-    ret
+/// Runs the statement once. Rows it returns are ignored.
+pub fn execute(cancel: &AtomicBool, db: &Connection, payload: &[u8]) -> Result<(), ServiceError> {
+    let mut stmt = prepare(cancel, db, payload)?;
+    stmt.raw_query().next().map_err(|e| ServiceError::sqlite(&e))?;
+    Ok(())
 }
 
-pub fn service_query(self_: &mut ServiceState) -> ServiceError {
-    let ret = 'body: {
-        let mut stmt = match prepare(self_.cancel, &mut self_.res, self_.payload, self_.db) {
-            Ok(stmt) => stmt,
-            Err(ret) => break 'body ret,
-        };
+/// Runs the statement and appends every row to `out` as a JSON array of
+/// objects.
+pub fn query(cancel: &AtomicBool, db: &Connection, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ServiceError> {
+    let mut stmt = prepare(cancel, db, payload)?;
 
-        let mut res_doc = JsonWriter::new(self_.json_buf);
-        if let Err(e) = protocol_json_from_stmt(&mut res_doc, &mut stmt) {
-            self_.res = ServiceRes::Msg(Cow::Owned(sqlite_errmsg(&e)));
-            break 'body SERVICE_ERROR_SQLITE;
-        }
-
-        if res_doc.failed {
-            self_.res = ServiceRes::Msg(Cow::Borrowed("cant create json"));
-            break 'body SERVICE_ERROR_CANT_CREATE_JSON;
-        }
-
-        self_.status = 200;
-        self_.res = ServiceRes::Json;
-        return SERVICE_OK;
-    };
-
-    // cleanup:
-    self_.status = 500;
-    ret
+    let mut json = JsonWriter::new(out);
+    write_rows(&mut json, &mut stmt).map_err(|e| ServiceError::sqlite(&e))?;
+    if json.failed {
+        return Err(ServiceError::Failed(Cow::Borrowed("cant create json")));
+    }
+    Ok(())
 }

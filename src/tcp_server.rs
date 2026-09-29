@@ -1,37 +1,37 @@
-// Port of TcpServer.h / TcpServer.c
-//
-// Same design: one thread polls the listening socket and every client,
-// accepts new clients up to MaxClients, and calls OnReadable in a loop until
-// the socket would block. poll() + pollfd arrays become mio (epoll / kqueue /
-// IOCP), the function-pointer callbacks + `void* ClientData` become a trait
-// with an associated per-client type.
+// The event loop. One thread polls the listening socket and every client
+// through mio (epoll / kqueue / IOCP), accepts new clients up to
+// `max_clients`, and calls `on_readable` until a client's socket is drained.
 
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-pub type TcpServerError = i16;
-pub const TCP_SERVER_ERROR_EMPTY_READ: TcpServerError = -1;
-pub const TCP_SERVER_ERROR_READ: TcpServerError = -2;
-/// C: TcpServerErrorRead with errno == EAGAIN/EWOULDBLOCK.
-pub const TCP_SERVER_ERROR_WOULD_BLOCK: TcpServerError = -3;
-/// Not in C: the read returned less than the buffer size, so the socket is
-/// (very likely) empty for now. See the read loop in `run`.
-pub const TCP_SERVER_READ_SHORT: TcpServerError = 1;
+/// What `on_readable` tells the event loop after one read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadStatus {
+    /// Read a full buffer (or was interrupted); there may be more.
+    More,
+    /// Read less than the buffer size, so the socket is very likely empty
+    /// for now. See the read loop in `run`.
+    Short,
+    /// The read would block: the socket is drained.
+    WouldBlock,
+    /// The client closed the connection, or the read failed.
+    Closed,
+}
 
-/// Size of the buffer OnReadable reads into (C: `char Buffer[8192]` on the
-/// stack). Allocated once and reused, so it isn't zeroed per read.
-pub const TCP_SERVER_READ_BUFFER_SIZE: usize = 8192;
+/// Size of the buffer `on_readable` reads into. Allocated once and reused,
+/// so it isn't zeroed per read.
+const READ_BUFFER_SIZE: usize = 8192;
 
 pub trait TcpServerCallbacks {
     type ClientData;
 
     /// None rejects the client (the socket is closed).
     fn on_connect(&mut self, client: &std::net::TcpStream) -> Option<Self::ClientData>;
-    fn on_readable(&mut self, client: &mut TcpStream, data: &mut Self::ClientData, buf: &mut [u8]) -> i16;
+    fn on_readable(&mut self, client: &mut TcpStream, data: &mut Self::ClientData, buf: &mut [u8]) -> ReadStatus;
     fn on_disconnect(&mut self, data: Self::ClientData);
 }
 
@@ -52,7 +52,6 @@ pub struct TcpServer<D> {
     free: Vec<usize>,
     max_clients: u16,
     client_count: u16,
-    running: AtomicBool,
     read_buf: Box<[u8]>,
 }
 
@@ -61,7 +60,6 @@ fn token(slot: usize, generation: u16) -> Token {
 }
 
 impl<D> TcpServer<D> {
-    /// TcpServerCreate
     pub fn create(port: u16, max_clients: u16) -> io::Result<TcpServer<D>> {
         if max_clients == 0 {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -69,10 +67,10 @@ impl<D> TcpServer<D> {
 
         let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
 
-        // C: setsockopt(SO_REUSEADDR) and setsockopt(SOL_SOCKET, 15), both
-        // unchecked. 15 is SO_REUSEPORT on Linux. On Windows SO_REUSEADDR
-        // means something else (a second server may bind the same port), and
-        // the Unix meaning is Windows' default, so it isn't set there.
+        // Best effort, errors ignored. On Windows SO_REUSEADDR means something
+        // else (a second server may bind the same port), and the Unix meaning
+        // is Windows' default, so it isn't set there. Note that SO_REUSEPORT
+        // lets a second riffdb bind the same port on Linux.
         #[cfg(unix)]
         let _ = socket.set_reuse_address(true);
         #[cfg(target_os = "linux")]
@@ -94,15 +92,8 @@ impl<D> TcpServer<D> {
             free: (0..max_clients as usize).rev().collect(),
             max_clients,
             client_count: 0,
-            running: AtomicBool::new(false),
-            read_buf: vec![0u8; TCP_SERVER_READ_BUFFER_SIZE].into_boxed_slice(),
+            read_buf: vec![0u8; READ_BUFFER_SIZE].into_boxed_slice(),
         })
-    }
-
-    /// TcpServerStop
-    #[allow(dead_code)]
-    pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
     }
 
     fn remove_client<C: TcpServerCallbacks<ClientData = D>>(&mut self, slot: usize, callbacks: &mut C) {
@@ -113,7 +104,7 @@ impl<D> TcpServer<D> {
         callbacks.on_disconnect(data);
 
         let _ = self.poll.registry().deregister(&mut stream);
-        drop(stream); // close(Fd)
+        drop(stream);
 
         self.generations[slot] = self.generations[slot].wrapping_add(1);
         self.free.push(slot);
@@ -129,11 +120,11 @@ impl<D> TcpServer<D> {
             };
 
             if self.client_count >= self.max_clients {
-                drop(stream); // close(ClientFd)
+                drop(stream);
                 continue;
             }
 
-            // mio already made it non-blocking (C: SetNonBlocking).
+            // mio has already made it non-blocking.
             let std_stream = std::net::TcpStream::from(stream);
             let Some(data) = callbacks.on_connect(&std_stream) else {
                 continue;
@@ -153,18 +144,16 @@ impl<D> TcpServer<D> {
         }
     }
 
-    /// TcpServerRun
-    pub fn run<C: TcpServerCallbacks<ClientData = D>>(&mut self, callbacks: &mut C) -> i32 {
-        self.running.store(true, Ordering::SeqCst);
-
+    /// Runs the event loop. Returns only if polling fails.
+    pub fn run<C: TcpServerCallbacks<ClientData = D>>(&mut self, callbacks: &mut C) -> io::Result<()> {
         let mut events = Events::with_capacity(1024);
 
-        while self.running.load(Ordering::SeqCst) {
+        loop {
             if let Err(e) = self.poll.poll(&mut events, None) {
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                return -1;
+                return Err(e);
             }
 
             for event in events.iter() {
@@ -179,7 +168,6 @@ impl<D> TcpServer<D> {
                     continue;
                 }
 
-                // C: POLLERR | POLLHUP | POLLNVAL
                 if event.is_error() {
                     self.remove_client(slot, callbacks);
                     continue;
@@ -193,33 +181,31 @@ impl<D> TcpServer<D> {
                     let Some(client) = self.clients[slot].as_mut() else {
                         break;
                     };
-                    let rc = callbacks.on_readable(&mut client.stream, &mut client.data, &mut self.read_buf);
-                    if rc == TCP_SERVER_ERROR_WOULD_BLOCK {
+                    let status = callbacks.on_readable(&mut client.stream, &mut client.data, &mut self.read_buf);
+                    if status == ReadStatus::WouldBlock {
                         break;
                     }
                     // mio is edge-triggered: it only reports the socket again
-                    // after a read hits WouldBlock, which is what the C loop
-                    // does anyway (read until EAGAIN). On Windows that last
-                    // recv() is an extra syscall per request, plus mio's
-                    // re-arm; reregister() re-arms without it (the AFD poll
-                    // is resubmitted inside the next poll()). On epoll,
-                    // reregister is itself a syscall, so keep C's loop there.
+                    // after a read hits WouldBlock, so the loop reads until
+                    // then. On Windows that last recv() is an extra syscall
+                    // per request, plus mio's re-arm; reregister() re-arms
+                    // without it (the AFD poll is resubmitted inside the next
+                    // poll()). On epoll reregister is itself a syscall, so
+                    // there the loop just reads until EAGAIN.
                     #[cfg(windows)]
-                    if rc == TCP_SERVER_READ_SHORT {
+                    if status == ReadStatus::Short {
                         let tok = token(slot, self.generations[slot]);
                         if self.poll.registry().reregister(&mut client.stream, tok, Interest::READABLE).is_err() {
                             self.remove_client(slot, callbacks);
                         }
                         break;
                     }
-                    if rc == TCP_SERVER_ERROR_EMPTY_READ || rc == TCP_SERVER_ERROR_READ {
+                    if status == ReadStatus::Closed {
                         self.remove_client(slot, callbacks);
                         break;
                     }
                 }
             }
         }
-
-        0
     }
 }

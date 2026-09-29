@@ -1,20 +1,18 @@
-// Port of SocketActions.h / SocketActions.c
+// The network thread's side of a connection: read, parse, and hand complete
+// requests to the worker pool.
 
 use std::io::{ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::http_parser::{HttpParser, HTTP_PARSER_STATE_BODY, HTTP_PARSER_STATE_COMPLETE};
+use crate::http_parser::{HttpParser, ParserState};
 use crate::log::{self, LogVerbosity};
 use crate::log_trace;
 use crate::request::{ConnShared, Request};
-use crate::tcp_server::{
-    TcpServerCallbacks, TCP_SERVER_ERROR_EMPTY_READ, TCP_SERVER_ERROR_READ, TCP_SERVER_ERROR_WOULD_BLOCK,
-    TCP_SERVER_READ_SHORT,
-};
+use crate::tcp_server::{ReadStatus, TcpServerCallbacks};
 use crate::thread_pool::ThreadPool;
 
-/// The network thread's per-client state (C: the parser half of Request).
+/// Per-client state owned by the network thread.
 pub struct Connection {
     pub parser: HttpParser,
     /// Write handle + cancel flag, handed to workers with each request.
@@ -22,7 +20,7 @@ pub struct Connection {
     fd: u64,
 }
 
-/// The OS socket handle, for the trace logs (C logs the fd).
+/// The OS socket handle, for the trace logs.
 fn raw_fd(s: &std::net::TcpStream) -> u64 {
     #[cfg(unix)]
     {
@@ -34,14 +32,14 @@ fn raw_fd(s: &std::net::TcpStream) -> u64 {
     }
 }
 
-/// The C worker's "Full parser dump", done here because the parser now stays
-/// with the network thread. Only runs with trace logging on.
+/// Logs the parser state for a finished request. Only runs with trace
+/// logging on.
 #[cold]
 #[inline(never)]
 fn dump_parser(p: &HttpParser) {
     let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
     log_trace!("=== HttpParser dump ===");
-    log_trace!("  State          = {}", p.state);
+    log_trace!("  State          = {:?}", p.state);
     log_trace!("  SawCr          = {}", p.saw_cr as i32);
     log_trace!("  SawDoubleDot   = {}", p.saw_double_dot as i32);
     log_trace!("  Method         = {} (len={})", s(p.method()), p.method_len);
@@ -69,7 +67,6 @@ pub struct SocketActions<'a> {
 impl TcpServerCallbacks for SocketActions<'_> {
     type ClientData = Connection;
 
-    /// SocketActionsOnConnect
     fn on_connect(&mut self, client: &std::net::TcpStream) -> Option<Connection> {
         let fd = raw_fd(client);
         log_trace!("Client connected: fd={}", fd);
@@ -84,30 +81,28 @@ impl TcpServerCallbacks for SocketActions<'_> {
         })
     }
 
-    /// SocketActionsOnReadable
-    fn on_readable(&mut self, client: &mut mio::net::TcpStream, conn: &mut Connection, buf: &mut [u8]) -> i16 {
+    fn on_readable(&mut self, client: &mut mio::net::TcpStream, conn: &mut Connection, buf: &mut [u8]) -> ReadStatus {
         let n = match client.read(buf) {
-            Ok(0) => return TCP_SERVER_ERROR_EMPTY_READ,
+            Ok(0) => return ReadStatus::Closed,
             Ok(n) => n,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return TCP_SERVER_ERROR_WOULD_BLOCK,
-            Err(e) if e.kind() == ErrorKind::Interrupted => return 0,
-            Err(_) => return TCP_SERVER_ERROR_READ,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return ReadStatus::WouldBlock,
+            Err(e) if e.kind() == ErrorKind::Interrupted => return ReadStatus::More,
+            Err(_) => return ReadStatus::Closed,
         };
         let data = &buf[..n];
-        let ok = if n < buf.len() { TCP_SERVER_READ_SHORT } else { 0 };
+        let status = if n < buf.len() { ReadStatus::Short } else { ReadStatus::More };
 
         conn.parser.parse(data);
 
-        if conn.parser.state != HTTP_PARSER_STATE_BODY && conn.parser.state != HTTP_PARSER_STATE_COMPLETE {
-            return ok;
+        if conn.parser.state != ParserState::Body && conn.parser.state != ParserState::Complete {
+            return status;
         }
 
         conn.parser.parse_body(data);
 
-        // PORT FIX: only hand complete requests to a worker (C dispatches on
-        // every read once the headers are done, body complete or not).
-        if conn.parser.state != HTTP_PARSER_STATE_COMPLETE {
-            return ok;
+        // Wait for the whole body before dispatching.
+        if conn.parser.state != ParserState::Complete {
+            return status;
         }
 
         if log::enabled(LogVerbosity::Trace) {
@@ -120,13 +115,12 @@ impl TcpServerCallbacks for SocketActions<'_> {
             conn: Arc::clone(&conn.shared),
         };
 
-        // A full mailbox drops the request, like Enqueue in C.
+        // A full mailbox (1024 queued requests) drops the request.
         let _ = self.pool.process(req);
 
-        ok
+        status
     }
 
-    /// SocketActionsOnDisconnect
     fn on_disconnect(&mut self, conn: Connection) {
         log_trace!("Client disconnected: fd={}", conn.fd);
 

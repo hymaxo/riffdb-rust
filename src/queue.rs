@@ -1,9 +1,4 @@
-// Port of Queue.h / Queue.c
-//
-// Fixed-size ring buffer. Enqueue on a full queue silently drops the item,
-// same as the C version. Generic over the item type instead of `void*`.
-
-#![allow(dead_code)]
+// Fixed-size ring buffer.
 
 pub const QUEUE_CAPACITY: usize = 1024;
 
@@ -28,12 +23,12 @@ impl<T> Queue<T> {
         self.count == 0
     }
 
+    #[cfg(test)]
     pub fn peek(&self) -> Option<&T> {
         self.items[self.head as usize].as_ref()
     }
 
-    /// Returns the item back if the queue is full (C drops it silently; the
-    /// caller decides what dropping means).
+    /// Hands the item back if the queue is full.
     pub fn enqueue(&mut self, data: T) -> Result<(), T> {
         if self.count as usize == QUEUE_CAPACITY {
             return Err(data);
@@ -91,7 +86,7 @@ mod tests {
         for i in 0..QUEUE_CAPACITY {
             q.enqueue(i + 1).unwrap();
         }
-        assert_eq!(q.enqueue(9999), Err(9999)); // dropped, like the C version
+        assert_eq!(q.enqueue(9999), Err(9999));
         assert_eq!(q.count() as usize, QUEUE_CAPACITY);
         for i in 0..QUEUE_CAPACITY {
             assert_eq!(q.dequeue(), Some(i + 1));

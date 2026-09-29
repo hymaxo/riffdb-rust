@@ -1,11 +1,10 @@
-// Port of Protocol.h / Protocol.c
+// The JSON side of the API: reading `{"q": ..., "args": [...]}` payloads and
+// writing result rows.
 //
-// yyjson is replaced by serde for reading (a borrowing visitor that keeps
-// yyjson_obj_get's semantics, see `Payload`) and by `JsonWriter` for writing
-// (same bytes as yyjson_mut_write without flags: insertion order, duplicate
-// keys allowed, fails on NaN/Inf and invalid UTF-8).
-//
-// ProtocolBindMsgpackArgsToStmt (cwpack) is not ported: it was never called.
+// Payloads are read with a borrowing serde visitor, so the SQL text and
+// string arguments are usually not copied. Rows are written by `JsonWriter`
+// straight into the response buffer: compact, columns in order, duplicate
+// column names kept, and NaN/Inf or invalid UTF-8 fail the whole result.
 
 use rusqlite::types::ValueRef;
 use rusqlite::Statement;
@@ -21,12 +20,11 @@ use crate::log_warn;
 // Request payload: {"q": "...", "args": [...]}
 // ---------------------------------------------------------------------------
 
-/// One element of `args`, as ProtocolBindJsonArgsToStmt sees it.
+/// One element of `args`.
 #[derive(Debug, PartialEq)]
 pub enum Arg<'a> {
     Str(Cow<'a, str>),
-    /// yyjson_is_int (signed or unsigned); yyjson_get_sint reinterprets
-    /// values above i64::MAX.
+    /// Any JSON integer. Values above i64::MAX wrap around.
     Int(i64),
     Real(f64),
     Bool(bool),
@@ -35,21 +33,20 @@ pub enum Arg<'a> {
     Skip,
 }
 
-/// What Service.c's Prepare() reads from the parsed document. yyjson_obj_get
-/// returns the *first* matching key, and nothing if the root isn't an object.
+/// The parts of a payload the service uses. For duplicate keys the first one
+/// wins, and a root that isn't an object has neither key.
 #[derive(Debug, Default, PartialEq)]
 pub struct Payload<'a> {
     /// None: no "q" key (or root isn't an object).
-    /// Some(None): "q" isn't a string (yyjson_get_str gives NULL, len 0).
+    /// Some(None): "q" isn't a string.
     pub q: Option<Option<Cow<'a, str>>>,
     /// None: no "args" key. A non-array "args" is Some(empty): it binds
-    /// nothing, same as yyjson_arr_size() == 0.
+    /// nothing.
     pub args: Option<Vec<Arg<'a>>>,
 }
 
-/// yyjson_read(Payload, PayloadLen, 0): strict JSON, the whole buffer must be
-/// one document.
-pub fn protocol_parse_payload(payload: &[u8]) -> Result<Payload<'_>, serde_json::Error> {
+/// Parses a request body. Strict JSON: the whole buffer must be one document.
+pub fn parse_payload(payload: &[u8]) -> Result<Payload<'_>, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(payload);
     let doc = de.deserialize_any(PayloadVisitor)?;
     de.end()?;
@@ -191,7 +188,7 @@ impl<'de> de::Deserialize<'de> for ArgsValue<'de> {
     }
 }
 
-/// Any JSON value -> Arg (the type switch of ProtocolBindJsonArgsToStmt).
+/// Any JSON value -> Arg.
 struct ArgSeed;
 
 impl<'de> DeserializeSeed<'de> for ArgSeed {
@@ -241,10 +238,10 @@ impl<'de> Visitor<'de> for ArgSeed {
     }
 }
 
-/// ProtocolBindJsonArgsToStmt. Bind errors (e.g. more args than `?`s) are
-/// ignored, like the unchecked sqlite3_bind_* calls in C.
-pub fn protocol_bind_json_args_to_stmt(args: &[Arg], stmt: &mut Statement) -> i32 {
-    // TODO: ssleert - add normal error handling
+/// Binds `args` to the statement's `?` placeholders in order. Bind errors
+/// (e.g. more args than placeholders) are ignored; unbound placeholders are
+/// NULL.
+pub fn bind_args(args: &[Arg], stmt: &mut Statement) {
     for (i, arg) in args.iter().enumerate() {
         let idx = i + 1;
         let _ = match arg {
@@ -256,16 +253,14 @@ pub fn protocol_bind_json_args_to_stmt(args: &[Arg], stmt: &mut Statement) -> i3
             Arg::Skip => Ok(()),
         };
     }
-
-    0
 }
 
 // ---------------------------------------------------------------------------
 // Result rows -> JSON
 // ---------------------------------------------------------------------------
 
-/// Minimal stand-in for yyjson_mut_doc + yyjson_mut_write, writing straight
-/// into a byte buffer.
+/// Writes JSON straight into a byte buffer. `failed` is set when a value
+/// can't be represented; the output is then unusable.
 pub struct JsonWriter<'a> {
     pub out: &'a mut Vec<u8>,
     pub failed: bool,
@@ -308,9 +303,9 @@ impl<'a> JsonWriter<'a> {
         JsonWriter { out, failed: false }
     }
 
-    /// Writes `s` as a JSON string, up to its first NUL (the C code only ever
-    /// sees NUL-terminated strings). `s` must be valid UTF-8 up to there.
-    /// Clean runs are found 8 bytes at a time and copied in bulk.
+    /// Writes `s` as a JSON string, up to its first NUL. `s` must be valid
+    /// UTF-8 up to there. Clean runs are found 8 bytes at a time and copied
+    /// in bulk.
     fn write_str(&mut self, s: &[u8]) {
         self.out.reserve(s.len() + 2);
         self.out.push(b'"');
@@ -353,9 +348,8 @@ impl<'a> JsonWriter<'a> {
         self.out.push(b'"');
     }
 
-    /// sqlite text as C sees it: sqlite3_column_text is NUL-terminated and
-    /// yyjson_mut_obj_add_strcpy strlen()s it, so text stops at the first
-    /// NUL. Invalid UTF-8 (before that NUL) fails like yyjson.
+    /// Writes sqlite text. Text is cut at the first NUL, and invalid UTF-8
+    /// before that point fails the write.
     fn write_text(&mut self, bytes: &[u8]) {
         let valid = match std::str::from_utf8(bytes) {
             Ok(_) => true,
@@ -386,15 +380,13 @@ impl<'a> JsonWriter<'a> {
     }
 }
 
-/// ProtocolJsonFromStmt: steps `stmt` to the end, writing every row as an
-/// object. Err is the sqlite error that stopped the stepping (C returns the
-/// step rc and the caller reads sqlite3_errmsg).
-pub fn protocol_json_from_stmt(doc: &mut JsonWriter, stmt: &mut Statement) -> rusqlite::Result<()> {
+/// Steps `stmt` to the end, writing `[{...},...]` with one object per row.
+/// Err is the sqlite error that stopped the stepping.
+pub fn write_rows(doc: &mut JsonWriter, stmt: &mut Statement) -> rusqlite::Result<()> {
     let column_count = stmt.column_count();
 
     // `"name":` for every column, escaped once per statement instead of once
-    // per cell (C re-adds the key for every row). A bad name only fails the
-    // write once a row uses it.
+    // per cell. A bad name only fails the write once a row uses it.
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(column_count);
     let mut keys_failed = false;
     for i in 0..column_count {
@@ -458,7 +450,7 @@ mod tests {
         let mut stmt = db.prepare(sql).unwrap();
         let mut out = Vec::new();
         let mut doc = JsonWriter::new(&mut out);
-        let ok = protocol_json_from_stmt(&mut doc, &mut stmt).is_ok();
+        let ok = write_rows(&mut doc, &mut stmt).is_ok();
         let failed = doc.failed;
         (ok, String::from_utf8(out).unwrap(), failed)
     }
@@ -501,10 +493,10 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_and_invalid_utf8_fail_like_yyjson() {
+    fn non_finite_and_invalid_utf8_fail() {
         assert!(run("SELECT 1e999 AS inf").2);
         assert!(run("SELECT CAST(x'ff' AS TEXT) AS bad").2);
-        // C never sees the bytes after a NUL, so they can't fail the write
+        // bytes after a NUL are never looked at, so they can't fail the write
         let (_, json, failed) = run("SELECT 'ok' || char(0) || CAST(x'ff' AS TEXT) AS t");
         assert!(!failed);
         assert_eq!(json, r#"[{"t":"ok"}]"#);
@@ -644,11 +636,11 @@ mod tests {
     }
 
     fn parse(s: &str) -> Option<Payload<'_>> {
-        protocol_parse_payload(s.as_bytes()).ok()
+        parse_payload(s.as_bytes()).ok()
     }
 
     #[test]
-    fn payload_like_yyjson_obj_get() {
+    fn payload_parsing() {
         let p = parse(r#"{"q":"SELECT ?","args":["s",1,-2,1.5,true,null,[1],{"a":1},18446744073709551615]}"#).unwrap();
         assert_eq!(p.q, Some(Some(Cow::Borrowed("SELECT ?"))));
         assert_eq!(
@@ -662,7 +654,7 @@ mod tests {
                 Arg::Null,
                 Arg::Skip,
                 Arg::Skip,
-                Arg::Int(-1), // u64::MAX reinterpreted, like yyjson_get_sint
+                Arg::Int(-1), // u64::MAX wraps
             ]
         );
 

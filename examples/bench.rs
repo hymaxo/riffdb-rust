@@ -9,7 +9,7 @@
 // `scenarios` is an optional comma-separated filter (e.g. `health,execute`).
 // Failures (I/O errors, timeouts, non-200, malformed responses) are counted
 // and the connection is reopened, so a misbehaving server is measured rather
-// than aborting the run. `compare/` uses this against the C original.
+// than aborting the run. `compare/` also uses it against the C implementation.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -189,8 +189,8 @@ fn main() {
             name: "query_point",
             request: post("/query", r#"{"q":"SELECT id, name, score FROM bench WHERE id = ?","args":[500]}"#),
         },
-        // ~4 KB of JSON: the largest result the C original survives (its
-        // response buffer grows once, 4 -> 8 KiB, then overflows).
+        // ~4 KB of JSON: the largest result the C implementation can return
+        // (its response buffer grows once, 4 -> 8 KiB, then overflows).
         Scenario {
             name: "query_50",
             request: post("/query", r#"{"q":"SELECT * FROM bench LIMIT 50"}"#),
