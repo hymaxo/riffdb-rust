@@ -1,4 +1,4 @@
-# Builds the C original (ssleert/riffdb) and this port in one Linux image, so
+# Builds the C implementation (ssleert/riffdb) and riffdb-rust in one Linux image, so
 # both run on the same kernel, CPU and loopback. Build from the repo root:
 #
 #   docker build -f compare/Dockerfile -t riffdb-compare .
@@ -21,7 +21,7 @@ RUN git clone https://github.com/ssleert/riffdb.git /c \
       echo "mimalloc $(git -C libs/mimalloc rev-parse --short HEAD)"; \
       echo "wolfssl  $(git -C libs/wolfssl rev-parse --short HEAD)"; } > /c/REVISIONS
 
-# This port.
+# riffdb-rust.
 WORKDIR /rust
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo

@@ -1,8 +1,9 @@
-# riffdb (C) vs riffdb-rust
+# Benchmark: C riffdb vs riffdb-rust
 
-This benchmarks the C original ([ssleert/riffdb](https://github.com/ssleert/riffdb) @ `cb5b374`)
-against this port. Both are built and run in the same Linux container, so they share the
-kernel, the CPU and the loopback.
+This benchmarks the original C implementation
+([ssleert/riffdb](https://github.com/ssleert/riffdb) @ `cb5b374`) against this one. Both are
+built and run in the same Linux container, so they share the kernel, the CPU and the
+loopback.
 
 ```sh
 docker build -f compare/Dockerfile -t riffdb-compare .
@@ -68,18 +69,18 @@ every run**.
 - **Networking is at parity.** `health` doesn't touch SQLite, and at 155k req/s the two
   servers are within noise. mio's epoll loop costs the same as C's `poll()` loop, even
   though the Rust build doesn't use `-march=native` or mimalloc.
-- **Queries: +13–24%.** Most of this is the prepared-statement cache (C-7; C calls
+- **Queries: +13–24%.** Most of this is the prepared-statement cache (C calls
   `sqlite3_prepare_v3` on every request) and streaming rows straight into the response
-  (C-6; C builds a yyjson tree and then copies it). `query_50` gains the most, because it
+  (C builds a yyjson tree and then copies it). `query_50` gains the most, because it
   serializes the most JSON.
 - **Writes: 2.8–3.5×.** C uses sqlite's default busy handler, which sleeps 1, 2, 5… ms
-  between retries (sqlite 3.53 delay table, `nanosleep` on Linux), while a WAL write lock is held for microseconds. The port's
-  `busy_wait` yields, then sleeps 20 µs–1 ms under the same 5 s budget (C-8). p99 falls
-  from 2.9–6.5 ms to 0.4–1.4 ms.
+  between retries (sqlite 3.53 delay table, `nanosleep` on Linux), while a WAL write
+  lock is held for microseconds. riffdb-rust's `busy_wait` yields, then sleeps
+  20 µs–1 ms under the same 5 s budget. p99 falls from 2.9–6.5 ms to 0.4–1.4 ms.
 - **C isn't correct under load:**
   - *Crash on large results.* Any response over 8 KiB overflows `HttpResponse`'s buffer,
     which grows only once, from 4 to 8 KiB. `query_1000` killed the C server in all 6 runs.
-  - *Corrupted keep-alive responses with `-t > 1` (C-1).* A worker `send()`s and then
+  - *Corrupted keep-alive responses with `-t > 1`.* A worker `send()`s and then
     zeroes the connection's shared response buffer while another worker is already
     appending the next response. The client sees extra bytes after a response. This
     happened in every `-t 4` scenario, `health` included.
@@ -87,9 +88,8 @@ every run**.
 ## Caveats
 
 - The client runs in the same container as the server and competes with it for CPU, so
-  absolute numbers are well below native. On native Windows, `health` does about 250k
-  req/s with 8 connections; see [../docs/PERFORMANCE.md](../docs/PERFORMANCE.md).
-  Compare ratios, not absolute numbers.
+  absolute numbers are well below native (on native Windows, `health` does about 250k
+  req/s with 8 connections). Compare ratios, not absolute numbers.
 - Expect ±5–10% noise between runs. Ratios within about 1.05× mean parity.
 - C's `-t 4` throughput includes the requests that succeeded around the corrupted ones.
   Each corrupted response also forces a reconnect, which costs C a little throughput.

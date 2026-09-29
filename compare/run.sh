@@ -1,5 +1,5 @@
 #!/bin/sh
-# Benchmarks the C original against this port inside the compare image.
+# Benchmarks the C implementation against riffdb-rust inside the compare image.
 # Each (threads, scenario, round) starts a fresh server with an empty database;
 # C and Rust alternate so drift in the machine affects both equally.
 #
