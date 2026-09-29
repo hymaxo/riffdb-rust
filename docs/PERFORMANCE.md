@@ -71,6 +71,32 @@ What closed the gap:
 the index, and there's no safe way to skip that. It's a field read, so it doesn't
 show in the benchmarks.
 
+## Statement cache and busy handler
+
+These come after the safe migration. Numbers are from 3 alternating runs.
+
+| scenario    | before       | after                          |
+|-------------|--------------|--------------------------------|
+| health      | 250k         | 250k (unchanged)               |
+| query_point | 166k         | 194k (+17%)                    |
+| query_1000  | 9.8k         | 9.8k (unchanged; JSON-bound)   |
+| execute     | ~590, p99 62 ms | **~101k, p99 0.6 ms** (≈170×) |
+
+1. **Prepared-statement cache (C-7).** `prepare()` uses `Connection::prepare_cached`, which is
+   rusqlite's per-connection LRU of 16 statements. Behaviour doesn't change: `Rows` resets the
+   statement on drop, and the cache clears its bindings before reuse, so unbound parameters are
+   still `NULL`. After DDL, sqlite re-prepares the statement on its own, and a statement it
+   can't re-prepare fails with the same `sqlite3_errmsg`. The cache is keyed on
+   `sql.trim()`. That trim uses Unicode whitespace (U+00A0, for example), which sqlite's
+   tokenizer rejects, so any query whose text trimming would change skips the cache.
+2. **Busy handler (C-8).** `sqlite3_busy_timeout`'s callback sleeps 1, 2, 5, 10… ms, and on
+   Windows `Sleep(1)` becomes a whole 15.6 ms timer tick. A WAL write lock is held for
+   microseconds, so writers spent almost all of their time asleep. `database::busy_wait` yields
+   8 times, then sleeps 20 µs, doubling up to 1 ms, under the same 5 s budget (measured as
+   wall-clock time instead of summed nominal sleeps). On timeout the error is still
+   `database is locked` / 500, after 5.03 s (checked with an external `BEGIN IMMEDIATE`). All
+   20,000 concurrent `n = n + 1` updates from 16 clients land.
+
 ## Rust-side optimizations so far
 
 Machine: 16 threads, Windows 11. The server runs with `-t 4`. Numbers are averages of 3 alternating runs.
@@ -80,7 +106,7 @@ Machine: 16 threads, Windows 11. The server runs with `-t 4`. Numbers are averag
 | health      | 230k req/s    | 244k req/s (+6%) |
 | query_point | 154k req/s    | 164k req/s (+7%) |
 | query_1000  | 6.1k req/s, p99 3.7 ms | 10.7k req/s (+75%), p99 2.1 ms |
-| execute     | ~610 req/s    | ~600 req/s (lock-bound, see C-8) |
+| execute     | ~610 req/s    | ~600 req/s (lock-bound, see C-8; since fixed) |
 
 What the assembly showed, and what changed:
 
@@ -147,11 +173,12 @@ Performance:
   response. Streaming rows straight into the response buffer would avoid all of that.
   *Port:* done. Rows are streamed into the response buffer, and keys are escaped once per statement.
 - **C-7: no prepared-statement cache.** `sqlite3_prepare_v3` runs on every request.
-  *Port:* same; `rusqlite::prepare_cached` would be a behaviour-neutral next step.
+  *Port:* fixed; see "Statement cache and busy handler".
 - **C-8: writers contend across connections.** Each worker has its own connection, so concurrent
   writes fight over the SQLite write lock. The busy handler sleeps in whole milliseconds, so
   `execute` peaks at about 600 req/s with p99 about 61 ms. A single writer (or routing writes to one
-  worker) would remove the contention.
+  worker) would remove the contention. *Port:* the waits are fixed (about 100k req/s); see
+  "Statement cache and busy handler".
 - **C-9: round-robin dispatch ignores load.** A slow query blocks everything queued behind it on
   that worker while other workers sit idle.
 - **C-10: `poll()` scans every fd on each wakeup.** With 1024 connections that is O(n) per wakeup;

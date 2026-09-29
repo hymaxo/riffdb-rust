@@ -102,6 +102,10 @@ like C.
    are now ignored.
 10. **Windows port sharing.** `SO_REUSEADDR` is not set on Windows, because there it lets
     a second server share the port.
+11. **Lock waits.** The 5 s busy timeout is kept, but the wait between retries is 20 µs–1 ms
+    instead of sqlite's 1–100 ms sleeps (15.6 ms each on Windows). Contended `/execute` went
+    from about 600 to about 100k req/s. Prepared statements are also cached per worker; this
+    changes no output. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Kept as in C
 

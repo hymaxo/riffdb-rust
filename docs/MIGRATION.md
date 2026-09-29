@@ -39,6 +39,7 @@ Everything else is kept. The complete list with reasons is in the README
 ("Deliberate deviations from C"):
 
 - the ten PORT FIXes (memory safety, races, leaks, partial sends, more than 24 headers);
+- finer busy-handler waits (same 5 s timeout) and a prepared-statement cache;
 - Windows doesn't set `SO_REUSEADDR`;
 - the trace-level parser dump now runs on the network thread, just before dispatch, instead
   of in the worker;

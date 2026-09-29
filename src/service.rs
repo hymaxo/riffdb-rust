@@ -1,7 +1,8 @@
 // Port of Service.h / Service.c
 
-use rusqlite::{Connection, Statement};
+use rusqlite::{CachedStatement, Connection, Statement};
 use std::borrow::Cow;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::database::sqlite_errmsg;
@@ -59,13 +60,40 @@ impl<'a> ServiceState<'a> {
     }
 }
 
+/// A statement from the connection's cache, or a one-off one.
+enum Cached<'db> {
+    Hit(CachedStatement<'db>),
+    Fresh(Statement<'db>),
+}
+
+impl<'db> Deref for Cached<'db> {
+    type Target = Statement<'db>;
+    #[inline]
+    fn deref(&self) -> &Statement<'db> {
+        match self {
+            Cached::Hit(s) => s,
+            Cached::Fresh(s) => s,
+        }
+    }
+}
+
+impl<'db> DerefMut for Cached<'db> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Statement<'db> {
+        match self {
+            Cached::Hit(s) => s,
+            Cached::Fresh(s) => s,
+        }
+    }
+}
+
 #[inline]
 fn prepare<'db>(
     cancel: &AtomicBool,
     err: &mut ServiceRes,
     payload: &[u8],
     db: &'db Connection,
-) -> Result<Statement<'db>, ServiceError> {
+) -> Result<Cached<'db>, ServiceError> {
     if cancel.load(Ordering::SeqCst) {
         return Err(SERVICE_ERROR_CANCEL);
     }
@@ -87,7 +115,17 @@ fn prepare<'db>(
         return Err(SERVICE_ERROR_QUERY_LEN);
     }
 
-    let mut stmt = match db.prepare(query) {
+    // C re-prepares on every request (C-7). The per-connection statement
+    // cache is behaviour-neutral: rusqlite resets the statement (Rows drop)
+    // and clears its bindings before reuse. It keys on `sql.trim()`, which
+    // strips Unicode whitespace sqlite would reject, so only exactly-trimmed
+    // text goes through it.
+    let prepared = if query.trim().len() == query.len() {
+        db.prepare_cached(query).map(Cached::Hit)
+    } else {
+        db.prepare(query).map(Cached::Fresh)
+    };
+    let mut stmt = match prepared {
         Ok(stmt) => stmt,
         Err(e) => {
             *err = ServiceRes::Msg(Cow::Owned(sqlite_errmsg(&e)));

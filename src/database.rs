@@ -1,7 +1,8 @@
 // Port of DataBase.h / DataBase.c
 
 use rusqlite::{Connection, OpenFlags};
-use std::time::Duration;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 
 use crate::log_err;
 use crate::options::options;
@@ -55,6 +56,35 @@ pub fn database_create_if_not_exists() -> i32 {
     0
 }
 
+/// Busy handler with the same 5 s budget as `sqlite3_busy_timeout(db, 5000)`.
+///
+/// sqlite's default callback sleeps 1, 2, 5, 10... ms between retries, and on
+/// Windows `Sleep(1)` rounds up to the ~15.6 ms timer tick. WAL write locks
+/// are held for microseconds, so most of that time is wasted (C-8). This
+/// yields first, then backs off from 20 us to 1 ms.
+fn busy_wait(count: i32) -> bool {
+    thread_local!(static START: Cell<Option<Instant>> = const { Cell::new(None) });
+    const TIMEOUT: Duration = Duration::from_millis(5000);
+
+    let now = Instant::now();
+    let start = START.with(|s| {
+        if count == 0 || s.get().is_none() {
+            s.set(Some(now));
+        }
+        s.get().unwrap_or(now)
+    });
+    if now.duration_since(start) >= TIMEOUT {
+        return false;
+    }
+    if count < 8 {
+        std::thread::yield_now();
+    } else {
+        let us = 20u64 << ((count - 8).min(6) as u32); // 20 us .. 1280 us
+        std::thread::sleep(Duration::from_micros(us.min(1000)));
+    }
+    true
+}
+
 pub fn database_open(read_only: bool) -> Option<Connection> {
     let mut flags = OpenFlags::SQLITE_OPEN_CREATE;
     if read_only {
@@ -65,7 +95,8 @@ pub fn database_open(read_only: bool) -> Option<Connection> {
 
     match Connection::open_with_flags("./riff.db", flags) {
         Ok(db) => {
-            let _ = db.busy_timeout(Duration::from_millis(5000));
+            // C: sqlite3_busy_timeout(db, 5000). Same limit, finer waits (C-8).
+            let _ = db.busy_handler(Some(busy_wait));
             Some(db)
         }
         Err(e) => {
