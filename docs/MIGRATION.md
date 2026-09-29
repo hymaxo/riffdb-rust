@@ -1,123 +1,54 @@
-# Plan: migrating the remaining unsafe code
+# Migration: unsafe port → safe Rust (done)
 
-## Where the unsafe code is
+The crate is `#![forbid(unsafe_code)]`. This file records how each unsafe construct
+from the direct port was replaced, and the decisions behind it. The last raw-pointer
+version is commit `1b179b5`.
 
-`unsafe` occurrences outside test modules:
+## Decisions
 
-| module            | count | why it's unsafe                                                   |
-|-------------------|------:|-------------------------------------------------------------------|
-| sys               | 23 | libc / WinSock FFI                                                   |
-| tcp_server        |  9 | calloc'd `pollfd` / client-data arrays, raw callbacks                |
-| http_response     |  7 | malloc'd buffer behind a raw pointer                                 |
-| http_parser       |  6 | malloc'd header and body buffers, raw input pointer                  |
-| thread_pool       |  5 | workers hold `*const ThreadPool`, `SendPtr`                          |
-| main              |  5 | raw server/pool pointers                                             |
-| xmalloc           |  4 | the allocator itself                                                 |
-| worker, socket_actions | 3 + 3 | the shared `*mut Request`                                      |
-| service, protocol, database | 3 + 3 + 2 | sqlite FFI                                              |
-| queue             |  2 | `unsafe impl Send` (it stores pointers without dereferencing them)   |
-| others            |  1 each | FFI and C-string helpers                                       |
+| question | choice | why |
+|---|---|---|
+| SQLite binding | `rusqlite` on the bundled `libsqlite3-sys` | Zero `unsafe` in our code. The C build's `LIBSQLITE3_FLAGS` still apply, except `SQLITE_OMIT_AUTOINIT` (no safe `sqlite3_initialize`). `rusqlite`'s `extra_check` feature is off, so like C only the first statement runs. |
+| Event loop | `mio` + `socket2` | Keeps the C shape exactly: one poll thread, a read-until-`EAGAIN` loop, a worker pool. `socket2` sets the same listen options through a safe API. The `polling` crate's `add` is `unsafe`. |
+| Keep-alive ordering | unchanged (round-robin) | Same as C. Requests are now owned, so concurrency can't corrupt anything, but pipelined responses may be out of order, as in C. |
+| C quirks | kept bit-exact | Route-hash collisions, "query len < 3" for invalid JSON, the two `Content-Length` spellings, first-key-wins JSON. The tests are the oracle. |
+| Partial `send()` (C-2) | fixed | A safe writer has to handle short writes anyway. |
 
-Almost all of it comes from one design choice in the C code: **a single heap `Request`
-is shared by the network thread and a worker through a raw pointer.** It is never
-freed, and on disconnect its buffers are freed even though a worker may still be using
-them. Fixing that ownership (step 2) is what makes most of the other modules easy.
+## What replaced what
 
-## Safety net (in place)
-
-Run everything with `cargo test --release`. `RIFFDB_BIN=<exe>` runs the integration
-suites against another build.
-
-| suite | what it pins |
+| unsafe construct (direct port) | safe replacement |
 |---|---|
-| `src/http_parser.rs` tests | parsing at every split point, byte-by-byte input, large bodies, keep-alive reuse, truncation, content-length quirks, the >24 headers panic (`should_panic`: flip it when that's fixed) |
-| `src/http_response.rs` tests | exact wire bytes, growth past 8 KB |
-| `src/protocol.rs` tests | exact JSON bytes for every column type, escapes, NaN/Inf and invalid UTF-8 failures |
-| queue / channel / router / options tests | behaviour of the already-safe modules |
-| `tests/mod_test.rs` | the ported riffdb.js suite, 1 worker |
-| `tests/wire.rs` | raw keep-alive sockets against 4 workers: response integrity (catches C-1), split writes, 200 KB bodies and responses, error messages |
-| `examples/bench.rs` + `tools/asmfn.py` | performance; see [PERFORMANCE.md](PERFORMANCE.md) |
+| heap `Request` shared through `*mut` by the network thread and a worker | `Connection` (the network thread owns the parser) plus a `Request` **moved** to the worker (URL, body, `Arc<ConnShared>`) |
+| `Request` never freed; buffers freed on disconnect (use-after-free) | the network thread drops its `Connection`; queued or running requests keep their `Arc` and see `cancel` |
+| per-connection response buffer shared with workers (C-1 race) | one `HttpResponse` per worker, reused |
+| `xmalloc`'d header and body buffers | `Vec<u8>`; header values grow on demand (same 8191-byte limit) |
+| `strtoul` on a NUL-terminated header value | `strtoul_u32`, which emulates whitespace, sign, overflow → `ULONG_MAX`, and C `unsigned long` width |
+| `HttpHeader` array indexed out of bounds after 24 headers | extra headers are ignored |
+| `Queue` of `*mut c_void` + `unsafe impl Send` | generic `Queue<T>` / `Channel<T>` |
+| `ThreadPool` workers holding `*const ThreadPool` | an `Arc<Shared>` with the mailboxes and the `working` flag; `stop()` closes the channels, so it can actually join |
+| `sys.rs` (libc / WinSock FFI, `WSAPoll`) | `mio` + `socket2` |
+| `TcpServer` callbacks as fn pointers + `void*` | the `TcpServerCallbacks` trait with an associated `ClientData`; tokens carry a slot generation so stale events are ignored |
+| raw `sqlite3_*` calls, `sqlite3_errmsg` | `rusqlite` `Connection` / `Statement` / `Rows`; `sqlite_errmsg()` extracts the same text |
+| `serde_json::Value` payload | a borrowing visitor (`Payload` / `Arg`) with yyjson semantics |
+| `xstrdup`'d error strings, malloc'd JSON | `Cow<'static, str>` messages; JSON written into the response buffer |
+| `Any` union | an enum |
 
-Rule for every step: all suites green, and `bench` is no slower than the numbers
-in PERFORMANCE.md (`query_1000` about 10.7k req/s).
+## Behaviour changes
 
-## Steps
+Everything else is kept. The complete list with reasons is in the README
+("Deliberate deviations from C"):
 
-Each step is small enough to review and benchmark on its own.
+- the ten PORT FIXes (memory safety, races, leaks, partial sends, more than 24 headers);
+- Windows doesn't set `SO_REUSEADDR`;
+- the trace-level parser dump now runs on the network thread, just before dispatch, instead
+  of in the worker;
+- `ThreadPoolStop` returns, where in C it blocked forever.
 
-### 1. Leaf buffers become owned types (no threading change)
+## Verification
 
-- `HttpResponse` becomes `struct HttpResponse { buf: Vec<u8> }` with safe
-  `status_code` / `body` / `clear` methods. The wire-format tests carry over unchanged.
-- `HttpParser` keeps the same state machine but owns its buffers
-  (`Vec<u8>` body, header values allocated on demand instead of 24 × 8 KiB up front,
-  see C-5), with `feed(&mut self, &[u8])`. The parser tests switch from
-  `Parser::feed` to calling the method directly.
-- `Request` is allocated with `Box` instead of `xmalloc` + `write_bytes`, so its
-  fields run `Drop`.
-
-This step alone doesn't fix the use-after-free on disconnect, because the `Request`
-is still shared; that's step 2.
-
-### 2. Request ownership handoff (the core change)
-
-- The network thread owns a `Connection { parser, socket, cancel: Arc<AtomicBool> }`
-  for each client.
-- When a request completes, it sends a **`Job`** (method, url, body `Vec<u8>`, socket
-  handle, cancel flag) to a worker through a typed `Channel<Job>`. Nothing is
-  shared mutably any more.
-- The worker builds the response in its own buffer and sends it.
-- Disconnect just drops the `Connection`; a job in flight keeps its own socket
-  handle and sees `cancel`.
-- `Queue<T>` / `Channel<T>` become generic, which removes `unsafe impl Send`, `SendPtr`
-  and `*mut c_void`.
-
-This removes the use-after-free and the leaked `Request`, and makes C-1 impossible by construction.
-
-Open question: **ordering of keep-alive / pipelined requests.** Today two requests from
-one connection can run on two workers at once. Options:
-- (a) stop reading a connection while its job is in flight; this needs a worker → network-thread wakeup.
-- (b) route by connection to a fixed worker.
-- (c) keep it as it is.
-
-### 3. SQLite layer
-
-- `Db` / `Stmt` wrappers with `Drop` (finalize/close), either
-  hand-written over `libsqlite3-sys` or through `rusqlite`.
-- `service_*` returns `Result<Response, ServiceError>` instead of filling
-  `ServiceState` through out-pointers.
-- The request payload is parsed with a borrowing serde visitor instead of `Value`.
-  It keeps yyjson's semantics: the first `q`/`args` key wins, a non-object root means
-  "query is empty", nested values in `args` are skipped. That removes about 5 allocations per
-  request and lets arguments bind with `SQLITE_STATIC`, as in C.
-- Optional (behaviour-neutral) statement cache per worker (C-7).
-
-### 4. Networking
-
-- Replace `sys` + `tcp_server` with `std::net::{TcpListener, TcpStream}` plus a
-  readiness crate (`mio` or `polling`), or keep a minimal safe `poll` wrapper.
-- A worker send loop that handles partial writes (C-2).
-- Decide the Linux `SO_REUSEPORT` behaviour (C-3).
-- `tcp_server_create` failures report `os error 0` on Windows, because the cleanup
-  calls overwrite the WinSock error before `main` prints it. Return the error instead.
-
-### 5. Cleanup
-
-- Delete `xmalloc`, `xstrdup`, `any.rs` and the remaining `*const c_char` plumbing.
-- `main` becomes fully safe; `run_server` owns the pool (or an `Arc`) instead of
-  handing out raw pointers.
-- Goal: no `unsafe` outside the sqlite FFI wrapper, or none at all with `rusqlite`.
-
-## Decisions needed before starting
-
-1. **SQLite binding**: `rusqlite` (safe API, one more dependency, and we can't
-   pass `SQLITE_OMIT_*` flags the same way) or a thin wrapper of our own over `libsqlite3-sys`
-   (keeps the current build flags and exact control).
-2. **Event loop**: `mio`, `polling`, or our own `poll` wrapper. `tokio` is also an option,
-   but it's a much bigger change of design.
-3. **Keep-alive ordering**: option (a), (b) or (c) from step 2.
-4. **C quirks**: keep bit-exact during the migration, or fix as we go? These are the route-hash
-   collisions, `"query len < 3"` for invalid JSON, only two `Content-Length` spellings, and the
-   >24 header limit. Keeping them bit-exact means the tests stay the oracle, and fixes land as
-   separate commits later.
-5. **C-2 (partial send)**: fix now, or as part of step 4?
+- 31 unit tests, the 28 ported JS tests, and 5 wire tests against 4 workers. Checked with
+  30+ back-to-back full runs.
+- Byte-exact checks: HTTP responses, JSON output (golden and exhaustive escaping),
+  and payload semantics.
+- Performance: within a few percent of the unsafe build on every scenario. See
+  [PERFORMANCE.md](PERFORMANCE.md#the-safe-migration).

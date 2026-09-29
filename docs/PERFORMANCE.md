@@ -19,14 +19,57 @@ Client and server share one machine, so small-request numbers are noisy by
 
 ```sh
 cargo rustc --release --bin riffdb -- --emit asm -C "llvm-args=-x86-asm-syntax=intel"
-python tools/asmfn.py target/release/deps/riffdb.s socket_actions_on_readable --stats  # calls per function
-python tools/asmfn.py target/release/deps/riffdb.s worker_handler                      # full body, demangled
+# network thread (parser + socket actions are inlined into it)
+python tools/asmfn.py target/release/deps/riffdb.s 'TcpServer$LT$D$GT$3run' --stats
+# worker thread (router, service, protocol are inlined into std's thread entry)
+python tools/asmfn.py target/release/deps/riffdb.s __rust_begin_short_backtrace --stats
 ```
 
 The output is post-LTO, so most helpers are inlined into their callers. `--stats`
 lists every call a function makes. Heap calls (`HeapAlloc`/`HeapFree`,
 `process_heap_alloc`), `memset`, `core::fmt::write` or `from_utf8_lossy` on a
 hot path are the things to look for.
+
+For code that's hard to see in a whole-server benchmark, time it in isolation with an
+ignored unit test. For example, the JSON writer:
+`cargo test --release --bin riffdb json_micro -- --ignored --nocapture`.
+
+## The safe migration
+
+Here "unsafe" is the last raw-pointer build (commit `1b179b5`) and "safe" is the
+`#![forbid(unsafe_code)]` build. Numbers are from alternating runs in the same session.
+
+| scenario    | unsafe      | safe, first cut | safe, final |
+|-------------|-------------|-----------------|-------------|
+| health      | 253–263k    | 223k (−15%)     | 248k (−2%)  |
+| query_point | 167–181k    | 165k            | 169k (−3%, noise) |
+| query_1000  | 9.9–12.5k   | 9.2k (−7%)      | 10.5k (−4…−7%, p50 noisy) |
+| execute     | ~600        | ~590            | ~590        |
+
+What closed the gap:
+
+1. **Windows event loop.** `mio` on Windows is IOCP/AFD: edge-triggered, with each socket's
+   interest re-armed only after a read returns `WouldBlock`. That meant one extra `recv`
+   per request, plus a per-socket mutex and a re-arm. On Windows, a short read now calls
+   `Registry::reregister` instead; mio re-submits the AFD poll inside the next `poll()`,
+   so no extra `recv` is needed. `health` +10%. Linux keeps C's read-until-`EAGAIN`,
+   because there `reregister` is itself an `epoll_ctl` syscall.
+2. **JSON strings.** Clean 8-byte words are skipped with an exact SWAR test (a byte is
+   `< 0x20`, `"` or `\`). The C `strlen` cut-off is folded into the same pass.
+   Microbenchmark: 1000 benchmark rows 50 → 39 µs; 4 KiB clean strings 245 → 57 µs.
+   The first SWAR version was *slower* on short strings: after a failed word it retried
+   a word at every following byte. Fixed by byte-scanning to the escape first.
+3. **One `Arc` per connection instead of two** (socket and cancel flag). That halves
+   the refcount traffic between the network thread and the workers on every request.
+4. **In-place `/query` body.** The JSON is written straight into the response buffer after
+   64 bytes of reserved room; the header is then written right-aligned into that room.
+   This removes one copy of every result (C-6) and the scratch buffer.
+5. **A short-read ioctl remains on Windows.** It's the rest of the `health` gap and is
+   inherent to AFD polling. It doesn't exist on Linux/epoll.
+
+`rusqlite` adds one `sqlite3_column_count` call per cell: `Row::get_ref` bounds-checks
+the index, and there's no safe way to skip that. It's a field read, so it doesn't
+show in the benchmarks.
 
 ## Rust-side optimizations so far
 
@@ -81,14 +124,15 @@ Correctness:
 - **C-2: partial `send()` is ignored.** Client sockets are non-blocking, and the worker calls
   `send()` once, ignoring a short write. A large response can be truncated when the socket buffer
   is full. Windows loopback buffers enough that the wire test with a 400 KB response passes here, but
-  Linux is more likely to hit it. **Not fixed yet** (it is also in the port).
+  Linux is more likely to hit it. *Port:* fixed in the safe version (`send_all` in `worker.rs`).
 - **C-3: two servers can share a port.** Linux gets `SO_REUSEPORT` (option `15`), so a second riffdb
   on the same port starts "successfully" and the kernel load-balances connections between two
-  processes with different databases. (The Windows port had the same effect through WinSock's
-  `SO_REUSEADDR`; it now uses `SO_EXCLUSIVEADDRUSE`.)
+  processes with different databases. *Port:* kept on Linux as in C. On Windows `SO_REUSEADDR`
+  is no longer set, because there it allows the same thing.
 - **C-4: memory leaks.** The yyjson request document from `Prepare()` is leaked for every
   `/query` and `/execute`. The `yyjson_mut_write` output buffer is leaked for every `/query`.
   sqlite error strings are leaked, because the `XFree` sits after a `return`.
+  *Port:* nothing leaks (owned buffers).
 - Also listed in the README: heap overflow on responses over about 8 KB, body overflow on pipelined
   bytes, re-applied `BodyStart`, dispatch before the body is complete, more than 24 headers, the
   use-after-free on disconnect.
@@ -97,10 +141,13 @@ Performance:
 
 - **C-5: about 194 KiB allocated per connection up front.** `HttpParserInit` allocates 24 × 8 KiB
   header-value buffers plus a 2 KiB body, which is about 200 MB at the 1024-client limit.
+  *Port:* header values grow on demand; a connection starts at about 4 KiB.
 - **C-6: JSON is built as a tree and then serialized.** Every value in the `yyjson_mut_doc` is an
   allocation, the column name is re-added on every row, and the result is copied again into the
   response. Streaming rows straight into the response buffer would avoid all of that.
+  *Port:* done. Rows are streamed into the response buffer, and keys are escaped once per statement.
 - **C-7: no prepared-statement cache.** `sqlite3_prepare_v3` runs on every request.
+  *Port:* same; `rusqlite::prepare_cached` would be a behaviour-neutral next step.
 - **C-8: writers contend across connections.** Each worker has its own connection, so concurrent
   writes fight over the SQLite write lock. The busy handler sleeps in whole milliseconds, so
   `execute` peaks at about 600 req/s with p99 about 61 ms. A single writer (or routing writes to one
@@ -108,10 +155,11 @@ Performance:
 - **C-9: round-robin dispatch ignores load.** A slow query blocks everything queued behind it on
   that worker while other workers sit idle.
 - **C-10: `poll()` scans every fd on each wakeup.** With 1024 connections that is O(n) per wakeup;
-  epoll, kqueue or IOCP would scale better.
-- **C-11: one extra `read()` per request to get `EAGAIN`.** Avoided in the port, see (5) above.
-- **C-12: condvar signalled while holding the mutex.** Avoided in the port, see (6) above.
+  epoll, kqueue or IOCP would scale better. *Port:* `mio` uses epoll, kqueue or IOCP.
+- **C-11: one extra `read()` per request to get `EAGAIN`.** *Port:* kept on Linux, where edge-triggered
+  epoll requires it. Avoided on Windows via `reregister` (see "The safe migration").
+- **C-12: condvar signalled while holding the mutex.** *Port:* avoided; see (6) above.
 - **C-13: byte-at-a-time parser.** It runs a `switch` per byte and `strncmp`s every header twice for
   `Content-Length`. Scanning for `\r\n` and `:` with `memchr` would be much faster.
 - **C-14: about 20 `LogFlog` calls per request in the worker, even in release.** Each returns early,
-  but it is still about 20 calls plus argument setup.
+  but it is still about 20 calls plus argument setup. *Port:* the trace dump is behind one level check.

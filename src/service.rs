@@ -1,13 +1,11 @@
 // Port of Service.h / Service.c
 
-use libc::c_char;
-use libsqlite3_sys::*;
-use serde_json::Value;
-use std::ptr;
+use rusqlite::{Connection, Statement};
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::protocol::{protocol_bind_json_args_to_stmt, protocol_json_from_stmt, JsonWriter};
-use crate::utils::xstrdup;
+use crate::database::sqlite_errmsg;
+use crate::protocol::{protocol_bind_json_args_to_stmt, protocol_json_from_stmt, protocol_parse_payload, JsonWriter};
 
 pub type ServiceError = i32;
 pub const SERVICE_OK: ServiceError = 0;
@@ -19,168 +17,140 @@ pub const SERVICE_ERROR_SQLITE: ServiceError = -5;
 pub const SERVICE_ERROR_CANT_CREATE_JSON: ServiceError = -6;
 pub const SERVICE_ERROR_CANCEL: ServiceError = -7;
 
-pub struct ServiceState {
-    pub cancel: *const AtomicBool,
-    pub db: *mut sqlite3,
-    pub payload: *const c_char,
-    pub payload_len: u32,
+/// What `Res`/`ResSize` point at in C.
+pub enum ServiceRes {
+    /// A fixed or error message (C: string literal or strdup'd errmsg).
+    Msg(Cow<'static, str>),
+    /// The /query JSON, in `ServiceState::json_buf`.
+    Json,
+}
 
-    pub res_size: u32,
-    pub res: *const c_char,
+pub struct ServiceState<'a> {
+    pub cancel: &'a AtomicBool,
+    pub db: &'a Connection,
+    pub payload: &'a [u8],
+
+    pub res: ServiceRes,
     pub status: u16,
 
-    /// Owns the /query JSON that `res` points into (C: the yyjson output
-    /// buffer, which it leaked). Dropped with the state.
-    pub res_buf: Vec<u8>,
+    /// Where /query appends its JSON: the worker's response buffer (C: a
+    /// fresh yyjson doc + output buffer per query, leaked).
+    pub json_buf: &'a mut Vec<u8>,
+}
+
+impl<'a> ServiceState<'a> {
+    pub fn new(cancel: &'a AtomicBool, db: &'a Connection, payload: &'a [u8], json_buf: &'a mut Vec<u8>) -> Self {
+        ServiceState {
+            cancel,
+            db,
+            payload,
+            res: ServiceRes::Msg(Cow::Borrowed("")),
+            status: 0,
+            json_buf,
+        }
+    }
+
+    /// Res[0..ResSize]
+    pub fn res(&self) -> &[u8] {
+        match &self.res {
+            ServiceRes::Msg(m) => m.as_bytes(),
+            ServiceRes::Json => self.json_buf,
+        }
+    }
 }
 
 #[inline]
-unsafe fn prepare(
-    cancel: *const AtomicBool,
-    err: *mut *const c_char,
-    payload_len: u32,
-    payload: *const c_char,
-    db: *mut sqlite3,
-    stmt: *mut *mut sqlite3_stmt,
-) -> ServiceError {
-    if (*cancel).load(Ordering::SeqCst) {
-        return SERVICE_ERROR_CANCEL;
+fn prepare<'db>(
+    cancel: &AtomicBool,
+    err: &mut ServiceRes,
+    payload: &[u8],
+    db: &'db Connection,
+) -> Result<Statement<'db>, ServiceError> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(SERVICE_ERROR_CANCEL);
     }
-
-    let payload_slice: &[u8] = if payload_len == 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(payload as *const u8, payload_len as usize)
+    let Ok(doc) = protocol_parse_payload(payload) else {
+        // (sic) message kept from the original
+        *err = ServiceRes::Msg(Cow::Borrowed("query len < 3"));
+        return Err(SERVICE_ERROR_INCORRECT_JSON);
     };
 
-    let doc: Value = match serde_json::from_slice(payload_slice) {
-        Ok(v) => v,
-        Err(_) => {
-            // (sic) message kept from the original
-            *err = c"query len < 3".as_ptr();
-            return SERVICE_ERROR_INCORRECT_JSON;
-        }
-    };
-    let root = &doc;
-
-    let Some(query_obj) = root.get("q") else {
-        *err = c"query is empty".as_ptr();
-        return SERVICE_ERROR_QUERY_EMPTY;
+    let Some(query_obj) = doc.q else {
+        *err = ServiceRes::Msg(Cow::Borrowed("query is empty"));
+        return Err(SERVICE_ERROR_QUERY_EMPTY);
     };
 
     // yyjson_get_str / yyjson_get_len on a non-string yield NULL / 0
-    let (query, query_len) = match query_obj.as_str() {
-        Some(s) => (s.as_ptr() as *const c_char, s.len()),
-        None => (ptr::null(), 0),
+    let query: &str = query_obj.as_deref().unwrap_or("");
+    if query.len() < 3 {
+        *err = ServiceRes::Msg(Cow::Borrowed("query len < 3"));
+        return Err(SERVICE_ERROR_QUERY_LEN);
+    }
+
+    let mut stmt = match db.prepare(query) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            *err = ServiceRes::Msg(Cow::Owned(sqlite_errmsg(&e)));
+            return Err(SERVICE_ERROR_SQLITE);
+        }
     };
-    if query_len < 3 {
-        *err = c"query len < 3".as_ptr();
-        return SERVICE_ERROR_QUERY_LEN;
-    }
 
-    let args = root.get("args");
-
-    let mut rc = sqlite3_prepare_v3(db, query, query_len as i32, 0, stmt, ptr::null_mut());
-    if rc != SQLITE_OK {
-        *err = xstrdup(sqlite3_errmsg(db));
-        return SERVICE_ERROR_SQLITE;
-    }
-
-    if let Some(args) = args {
-        if args.as_array().is_some_and(|a| !a.is_empty()) {
-            rc = protocol_bind_json_args_to_stmt(args, *stmt);
-            if rc != 0 {
-                return SERVICE_ERROR_PROTOCOL;
-            }
+    if let Some(args) = &doc.args {
+        if !args.is_empty() && protocol_bind_json_args_to_stmt(args, &mut stmt) != 0 {
+            return Err(SERVICE_ERROR_PROTOCOL);
         }
     }
 
-    SERVICE_OK
+    Ok(stmt)
 }
 
-pub unsafe fn service_execute(self_: *mut ServiceState) -> ServiceError {
-    let mut ret;
-    let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+pub fn service_execute(self_: &mut ServiceState) -> ServiceError {
+    let ret = 'body: {
+        let mut stmt = match prepare(self_.cancel, &mut self_.res, self_.payload, self_.db) {
+            Ok(stmt) => stmt,
+            Err(ret) => break 'body ret,
+        };
 
-    'body: {
-        ret = prepare(
-            (*self_).cancel,
-            ptr::addr_of_mut!((*self_).res),
-            (*self_).payload_len,
-            (*self_).payload,
-            (*self_).db,
-            &mut stmt,
-        );
-        if ret != SERVICE_OK {
-            break 'body;
+        // One sqlite3_step: SQLITE_ROW or SQLITE_DONE are both fine.
+        if let Err(e) = stmt.raw_query().next() {
+            self_.res = ServiceRes::Msg(Cow::Owned(sqlite_errmsg(&e)));
+            break 'body SERVICE_ERROR_SQLITE;
         }
 
-        let rc = sqlite3_step(stmt);
-        if rc != SQLITE_ROW && rc != SQLITE_DONE {
-            (*self_).res = xstrdup(sqlite3_errmsg((*self_).db));
-            ret = SERVICE_ERROR_SQLITE;
-            break 'body;
-        }
-
-        (*self_).status = 200;
-        (*self_).res_size = 2;
-        (*self_).res = c"ok".as_ptr();
-
-        sqlite3_finalize(stmt);
+        self_.status = 200;
+        self_.res = ServiceRes::Msg(Cow::Borrowed("ok"));
         return SERVICE_OK;
-    }
+    };
 
     // cleanup:
-    (*self_).status = 500;
-    sqlite3_finalize(stmt);
+    self_.status = 500;
     ret
 }
 
-/// On success `res` points into `res_buf`.
-pub unsafe fn service_query(self_: *mut ServiceState) -> ServiceError {
-    let mut ret;
-    let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+pub fn service_query(self_: &mut ServiceState) -> ServiceError {
+    let ret = 'body: {
+        let mut stmt = match prepare(self_.cancel, &mut self_.res, self_.payload, self_.db) {
+            Ok(stmt) => stmt,
+            Err(ret) => break 'body ret,
+        };
 
-    let mut res_doc = JsonWriter::new();
-    'body: {
-        ret = prepare(
-            (*self_).cancel,
-            ptr::addr_of_mut!((*self_).res),
-            (*self_).payload_len,
-            (*self_).payload,
-            (*self_).db,
-            &mut stmt,
-        );
-        if ret != SERVICE_OK {
-            break 'body;
-        }
-
-        let rc = protocol_json_from_stmt(&mut res_doc, stmt);
-        if rc != SQLITE_DONE {
-            (*self_).res = xstrdup(sqlite3_errmsg((*self_).db));
-            ret = SERVICE_ERROR_SQLITE;
-            break 'body;
+        let mut res_doc = JsonWriter::new(self_.json_buf);
+        if let Err(e) = protocol_json_from_stmt(&mut res_doc, &mut stmt) {
+            self_.res = ServiceRes::Msg(Cow::Owned(sqlite_errmsg(&e)));
+            break 'body SERVICE_ERROR_SQLITE;
         }
 
         if res_doc.failed {
-            (*self_).res = c"cant create json".as_ptr();
-            ret = SERVICE_ERROR_CANT_CREATE_JSON;
-            break 'body;
+            self_.res = ServiceRes::Msg(Cow::Borrowed("cant create json"));
+            break 'body SERVICE_ERROR_CANT_CREATE_JSON;
         }
 
-        // Hand the buffer over instead of copying it into a malloc'd block.
-        (*self_).res_buf = std::mem::take(&mut res_doc.out);
-
-        (*self_).status = 200;
-        (*self_).res_size = (*self_).res_buf.len() as u32;
-        (*self_).res = (*self_).res_buf.as_ptr() as *const c_char;
-
-        sqlite3_finalize(stmt);
+        self_.status = 200;
+        self_.res = ServiceRes::Json;
         return SERVICE_OK;
-    }
+    };
 
     // cleanup:
-    (*self_).status = 500;
-    sqlite3_finalize(stmt);
+    self_.status = 500;
     ret
 }

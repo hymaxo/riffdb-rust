@@ -1,96 +1,137 @@
 // Port of SocketActions.h / SocketActions.c
 
-use libc::{c_char, c_void};
-use std::mem::{size_of, MaybeUninit};
-use std::ptr;
+use std::io::{ErrorKind, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use crate::http_parser::{
-    http_parser_free, http_parser_init, http_parser_parse, http_parser_parse_body, HTTP_PARSER_STATE_BODY,
-    HTTP_PARSER_STATE_COMPLETE,
+use crate::http_parser::{HttpParser, HTTP_PARSER_STATE_BODY, HTTP_PARSER_STATE_COMPLETE};
+use crate::log::{self, LogVerbosity};
+use crate::log_trace;
+use crate::request::{ConnShared, Request};
+use crate::tcp_server::{
+    TcpServerCallbacks, TCP_SERVER_ERROR_EMPTY_READ, TCP_SERVER_ERROR_READ, TCP_SERVER_ERROR_WOULD_BLOCK,
+    TCP_SERVER_READ_SHORT,
 };
-use crate::http_response::{http_response_free, http_response_init};
-use crate::request::Request;
-use crate::sys::{self, Socket};
-use crate::tcp_server::{TcpServer, TCP_SERVER_ERROR_EMPTY_READ, TCP_SERVER_ERROR_READ, TCP_SERVER_READ_DRAINED};
 use crate::thread_pool::ThreadPool;
-use crate::xmalloc::{xfree, xmalloc};
-use crate::{log_err, log_trace};
 
-pub unsafe fn socket_actions_on_connect(_server: *mut TcpServer, client_fd: Socket, client_data: *mut *mut c_void) {
-    log_trace!("Client connected: fd={}", client_fd);
-
-    *client_data = xmalloc(size_of::<Request>());
-
-    let req = *client_data as *mut Request;
-
-    // *Req = (Request){ .ClientFd = ClientFd };
-    ptr::write_bytes(req, 0, 1);
-    (*req).client_fd = client_fd;
-    ptr::write(ptr::addr_of_mut!((*req).cancel), AtomicBool::new(false));
-
-    http_parser_init(ptr::addr_of_mut!((*req).state.parser));
-    http_response_init(ptr::addr_of_mut!((*req).state.response));
+/// The network thread's per-client state (C: the parser half of Request).
+pub struct Connection {
+    pub parser: HttpParser,
+    /// Write handle + cancel flag, handed to workers with each request.
+    pub shared: Arc<ConnShared>,
+    fd: u64,
 }
 
-pub unsafe fn socket_actions_on_readable(server: *mut TcpServer, client_fd: Socket, client_data: *mut c_void) -> i16 {
-    let req = client_data as *mut Request;
-
-    // Left uninitialised like the C stack buffer: only the first `n` bytes
-    // (written by read) are ever looked at. Zeroing it cost a memset of 8 KiB
-    // per read.
-    let mut buffer = MaybeUninit::<[c_char; 8192]>::uninit();
-    let buffer_ptr = buffer.as_mut_ptr() as *mut c_char;
-    let n = sys::read(client_fd, buffer_ptr, 8192);
-
-    if n == 0 {
-        return TCP_SERVER_ERROR_EMPTY_READ;
+/// The OS socket handle, for the trace logs (C logs the fd).
+fn raw_fd(s: &std::net::TcpStream) -> u64 {
+    #[cfg(unix)]
+    {
+        std::os::fd::AsRawFd::as_raw_fd(s) as u64
     }
-    if n < 0 {
-        return TCP_SERVER_ERROR_READ;
+    #[cfg(windows)]
+    {
+        std::os::windows::io::AsRawSocket::as_raw_socket(s)
     }
-    // A short read means the socket is drained for now (see TCP_SERVER_READ_DRAINED).
-    let ok: i16 = if (n as usize) < 8192 { TCP_SERVER_READ_DRAINED } else { 0 };
-
-    let parser = ptr::addr_of_mut!((*req).state.parser);
-
-    let mut rc = http_parser_parse(parser, n as usize, buffer_ptr);
-    if rc < 0 {
-        log_err!("body parsing fucked up {}", rc);
-    }
-
-    if (*parser).state != HTTP_PARSER_STATE_BODY && (*parser).state != HTTP_PARSER_STATE_COMPLETE {
-        return ok;
-    }
-
-    rc = http_parser_parse_body(parser, n as usize, buffer_ptr);
-    if rc < 0 {
-        xfree(req as *mut c_void);
-        log_err!("body parsing fucked up {}", rc);
-    }
-
-    // PORT FIX: the C version dispatches to a worker even while the body is
-    // still incomplete (state == Body), so any body split across multiple
-    // read()s gets handled once per chunk with a truncated payload. Only hand
-    // the request off once it is complete.
-    if (*parser).state != HTTP_PARSER_STATE_COMPLETE {
-        return ok;
-    }
-
-    (*((*server).user_data as *const ThreadPool)).process(req as *mut c_void);
-
-    ok
 }
 
-pub unsafe fn socket_actions_on_disconnect(_server: *mut TcpServer, client_fd: Socket, client_data: *mut c_void) {
-    log_trace!("Client disconnected: fd={}", client_fd);
+/// The C worker's "Full parser dump", done here because the parser now stays
+/// with the network thread. Only runs with trace logging on.
+#[cold]
+#[inline(never)]
+fn dump_parser(p: &HttpParser) {
+    let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    log_trace!("=== HttpParser dump ===");
+    log_trace!("  State          = {}", p.state);
+    log_trace!("  SawCr          = {}", p.saw_cr as i32);
+    log_trace!("  SawDoubleDot   = {}", p.saw_double_dot as i32);
+    log_trace!("  Method         = {} (len={})", s(p.method()), p.method_len);
+    log_trace!("  Url            = {} (len={})", s(p.url()), p.url_len);
+    log_trace!("  HeadersLen     = {}", p.headers_len);
+    for (i, h) in p.headers[..p.headers_len as usize].iter().enumerate() {
+        log_trace!("  Header[{}]      = {}: {}", i, s(h.key()), s(&h.value));
+    }
+    log_trace!("  BodyStart      = {}", p.body_start);
+    log_trace!("  BodyCap        = {}", p.body.capacity());
+    log_trace!("  ConsumedBody   = {}", p.body.len());
+    log_trace!("  ContentLength  = {}", p.content_length);
+    if p.content_length > 0 {
+        log_trace!("  Body           = {}", s(&p.body));
+    } else {
+        log_trace!("  Body           = (null or empty)");
+    }
+    log_trace!("=== end HttpParser dump ===");
+}
 
-    let req = client_data as *mut Request;
-    // NOTE (kept from C): the Request itself is leaked here, and a worker
-    // that is still processing it will touch the freed parser/response
-    // buffers. To be addressed in the safe rewrite.
-    http_parser_free(ptr::addr_of_mut!((*req).state.parser));
-    http_response_free(ptr::addr_of_mut!((*req).state.response));
+pub struct SocketActions<'a> {
+    pub pool: &'a ThreadPool<Request>,
+}
 
-    (*req).cancel.store(true, Ordering::SeqCst);
+impl TcpServerCallbacks for SocketActions<'_> {
+    type ClientData = Connection;
+
+    /// SocketActionsOnConnect
+    fn on_connect(&mut self, client: &std::net::TcpStream) -> Option<Connection> {
+        let fd = raw_fd(client);
+        log_trace!("Client connected: fd={}", fd);
+
+        Some(Connection {
+            parser: HttpParser::new(),
+            shared: Arc::new(ConnShared {
+                client: client.try_clone().ok()?,
+                cancel: AtomicBool::new(false),
+            }),
+            fd,
+        })
+    }
+
+    /// SocketActionsOnReadable
+    fn on_readable(&mut self, client: &mut mio::net::TcpStream, conn: &mut Connection, buf: &mut [u8]) -> i16 {
+        let n = match client.read(buf) {
+            Ok(0) => return TCP_SERVER_ERROR_EMPTY_READ,
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return TCP_SERVER_ERROR_WOULD_BLOCK,
+            Err(e) if e.kind() == ErrorKind::Interrupted => return 0,
+            Err(_) => return TCP_SERVER_ERROR_READ,
+        };
+        let data = &buf[..n];
+        let ok = if n < buf.len() { TCP_SERVER_READ_SHORT } else { 0 };
+
+        conn.parser.parse(data);
+
+        if conn.parser.state != HTTP_PARSER_STATE_BODY && conn.parser.state != HTTP_PARSER_STATE_COMPLETE {
+            return ok;
+        }
+
+        conn.parser.parse_body(data);
+
+        // PORT FIX: only hand complete requests to a worker (C dispatches on
+        // every read once the headers are done, body complete or not).
+        if conn.parser.state != HTTP_PARSER_STATE_COMPLETE {
+            return ok;
+        }
+
+        if log::enabled(LogVerbosity::Trace) {
+            dump_parser(&conn.parser);
+        }
+
+        let req = Request {
+            url: conn.parser.url,
+            body: conn.parser.take_body(),
+            conn: Arc::clone(&conn.shared),
+        };
+
+        // A full mailbox drops the request, like Enqueue in C.
+        let _ = self.pool.process(req);
+
+        ok
+    }
+
+    /// SocketActionsOnDisconnect
+    fn on_disconnect(&mut self, conn: Connection) {
+        log_trace!("Client disconnected: fd={}", conn.fd);
+
+        // Requests still queued or running see this and skip / stop
+        // sending. The socket closes once the last of them is done with it.
+        conn.shared.cancel.store(true, Ordering::SeqCst);
+    }
 }

@@ -1,48 +1,31 @@
 // Port of Execute.h / Execute.c
 
-use libc::c_void;
-use std::ptr;
+use rusqlite::Connection;
 use std::sync::atomic::Ordering;
 
-use crate::http_response::{http_response_body, http_response_status_code};
+use crate::http_response::HttpResponse;
 use crate::http_utils::http_utils_res_error;
 use crate::log_trace;
 use crate::request::Request;
-use crate::service::{service_execute, ServiceState, SERVICE_ERROR_CANCEL, SERVICE_ERROR_SQLITE, SERVICE_OK};
-use crate::xmalloc::xfree;
+use crate::service::{service_execute, ServiceState, SERVICE_ERROR_CANCEL, SERVICE_OK};
 
-pub unsafe fn execute(req: *mut Request) {
-    let res = ptr::addr_of_mut!((*req).state.response);
-
-    let mut state = ServiceState {
-        cancel: ptr::addr_of!((*req).cancel),
-        db: (*req).worker.db,
-        payload: (*req).state.parser.body,
-        payload_len: (*req).state.parser.content_length,
-        res_size: 0,
-        res: ptr::null(),
-        status: 0,
-        res_buf: Vec::new(),
-    };
+pub fn execute(req: &Request, db: &Connection, res: &mut HttpResponse) {
+    let mut no_json = Vec::new(); // /execute never writes JSON
+    let mut state = ServiceState::new(&req.conn.cancel, db, &req.body, &mut no_json);
 
     let rc = service_execute(&mut state);
     if rc != SERVICE_OK {
         log_trace!("Rc = {}", rc);
         if rc != SERVICE_ERROR_CANCEL {
-            http_utils_res_error(res, state.status, state.res);
-            // PORT FIX: in C this free sits after the `return` and is
-            // unreachable, so every sqlite error message leaked.
-            if rc == SERVICE_ERROR_SQLITE {
-                xfree(state.res as *mut c_void);
-            }
+            http_utils_res_error(res, state.status, state.res());
             return;
         }
     }
 
-    if (*req).cancel.load(Ordering::SeqCst) {
+    if req.conn.cancel.load(Ordering::SeqCst) {
         return;
     }
 
-    http_response_status_code(res, state.status);
-    http_response_body(res, state.res_size, state.res);
+    res.status_code(state.status);
+    res.body(state.res());
 }

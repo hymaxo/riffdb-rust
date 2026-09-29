@@ -1,275 +1,225 @@
 // Port of TcpServer.h / TcpServer.c
 //
-// Single-threaded poll() loop. Slot 0 of `poll_fds` is the listening socket,
-// slot i+1 belongs to client i (whose opaque data lives in clients_data[i]).
+// Same design: one thread polls the listening socket and every client,
+// accepts new clients up to MaxClients, and calls OnReadable in a loop until
+// the socket would block. poll() + pollfd arrays become mio (epoll / kqueue /
+// IOCP), the function-pointer callbacks + `void* ClientData` become a trait
+// with an associated per-client type.
 
-use libc::c_void;
-use std::mem::size_of;
-use std::ptr;
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Token};
+use socket2::{Domain, Socket, Type};
+use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-use crate::sys::{self, PollFd, Socket, POLLERR, POLLHUP, POLLIN, POLLNVAL};
-use crate::xmalloc::{xcalloc, xfree};
 
 pub type TcpServerError = i16;
 pub const TCP_SERVER_ERROR_EMPTY_READ: TcpServerError = -1;
 pub const TCP_SERVER_ERROR_READ: TcpServerError = -2;
-/// Not in C: OnReadable read fewer bytes than its buffer holds, so the socket
-/// is drained for now. poll() is level-triggered and reports the fd again if
-/// more data arrives, so stop reading here instead of spending one more
-/// recv() just to get EWOULDBLOCK (saves a syscall per request).
-pub const TCP_SERVER_READ_DRAINED: TcpServerError = 1;
+/// C: TcpServerErrorRead with errno == EAGAIN/EWOULDBLOCK.
+pub const TCP_SERVER_ERROR_WOULD_BLOCK: TcpServerError = -3;
+/// Not in C: the read returned less than the buffer size, so the socket is
+/// (very likely) empty for now. See the read loop in `run`.
+pub const TCP_SERVER_READ_SHORT: TcpServerError = 1;
 
-pub type TcpServerOnConnect = unsafe fn(server: *mut TcpServer, client_fd: Socket, client_data: *mut *mut c_void);
-pub type TcpServerOnReadable = unsafe fn(server: *mut TcpServer, client_fd: Socket, client_data: *mut c_void) -> i16;
-pub type TcpServerOnDisconnect = unsafe fn(server: *mut TcpServer, client_fd: Socket, client_data: *mut c_void);
+/// Size of the buffer OnReadable reads into (C: `char Buffer[8192]` on the
+/// stack). Allocated once and reused, so it isn't zeroed per read.
+pub const TCP_SERVER_READ_BUFFER_SIZE: usize = 8192;
 
-pub struct TcpServer {
-    pub listen_fd: Socket,
-    pub poll_fds: *mut PollFd,
-    pub clients_data: *mut *mut c_void,
-    pub max_clients: u16,
-    pub client_count: u16,
-    pub running: AtomicBool,
-    pub on_connect: Option<TcpServerOnConnect>,
-    pub on_readable: Option<TcpServerOnReadable>,
-    pub on_disconnect: Option<TcpServerOnDisconnect>,
-    pub user_data: *mut c_void,
+pub trait TcpServerCallbacks {
+    type ClientData;
+
+    /// None rejects the client (the socket is closed).
+    fn on_connect(&mut self, client: &std::net::TcpStream) -> Option<Self::ClientData>;
+    fn on_readable(&mut self, client: &mut TcpStream, data: &mut Self::ClientData, buf: &mut [u8]) -> i16;
+    fn on_disconnect(&mut self, data: Self::ClientData);
 }
 
-impl TcpServer {
-    pub const fn zeroed() -> TcpServer {
-        TcpServer {
-            listen_fd: sys::INVALID_SOCKET,
-            poll_fds: ptr::null_mut(),
-            clients_data: ptr::null_mut(),
-            max_clients: 0,
+const LISTENER: Token = Token(usize::MAX);
+
+struct Client<D> {
+    stream: TcpStream,
+    data: D,
+}
+
+pub struct TcpServer<D> {
+    poll: Poll,
+    listener: TcpListener,
+    clients: Vec<Option<Client<D>>>,
+    /// Bumped whenever a slot is freed, and part of the token, so a stale
+    /// event can't reach the next client in the same slot.
+    generations: Vec<u16>,
+    free: Vec<usize>,
+    max_clients: u16,
+    client_count: u16,
+    running: AtomicBool,
+    read_buf: Box<[u8]>,
+}
+
+fn token(slot: usize, generation: u16) -> Token {
+    Token(slot | (generation as usize) << 16)
+}
+
+impl<D> TcpServer<D> {
+    /// TcpServerCreate
+    pub fn create(port: u16, max_clients: u16) -> io::Result<TcpServer<D>> {
+        if max_clients == 0 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+
+        // C: setsockopt(SO_REUSEADDR) and setsockopt(SOL_SOCKET, 15), both
+        // unchecked. 15 is SO_REUSEPORT on Linux. On Windows SO_REUSEADDR
+        // means something else (a second server may bind the same port), and
+        // the Unix meaning is Windows' default, so it isn't set there.
+        #[cfg(unix)]
+        let _ = socket.set_reuse_address(true);
+        #[cfg(target_os = "linux")]
+        let _ = socket.set_reuse_port(true);
+
+        socket.set_nonblocking(true)?;
+        socket.bind(&SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+        socket.listen(128)?;
+
+        let mut listener = TcpListener::from_std(socket.into());
+        let poll = Poll::new()?;
+        poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
+
+        Ok(TcpServer {
+            poll,
+            listener,
+            clients: (0..max_clients).map(|_| None).collect(),
+            generations: vec![0; max_clients as usize],
+            free: (0..max_clients as usize).rev().collect(),
+            max_clients,
             client_count: 0,
             running: AtomicBool::new(false),
-            on_connect: None,
-            on_readable: None,
-            on_disconnect: None,
-            user_data: ptr::null_mut(),
-        }
-    }
-}
-
-unsafe fn remove_client(server: *mut TcpServer, index: u16) {
-    let fd = (*(*server).poll_fds.add(index as usize + 1)).fd;
-    let client_data = *(*server).clients_data.add(index as usize);
-
-    ((*server).on_disconnect.unwrap())(server, fd, client_data);
-
-    sys::close(fd);
-
-    let last = (*server).client_count - 1;
-    if index != last {
-        *(*server).clients_data.add(index as usize) = *(*server).clients_data.add(last as usize);
-        *(*server).poll_fds.add(index as usize + 1) = *(*server).poll_fds.add(last as usize + 1);
+            read_buf: vec![0u8; TCP_SERVER_READ_BUFFER_SIZE].into_boxed_slice(),
+        })
     }
 
-    (*server).client_count -= 1;
-}
-
-pub unsafe fn tcp_server_create(server: *mut TcpServer, port: u16, max_clients: u16) -> i32 {
-    if server.is_null() || max_clients == 0 {
-        return -1;
+    /// TcpServerStop
+    #[allow(dead_code)]
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
     }
 
-    let mut is_error = false;
-    let listen_fd: Socket;
+    fn remove_client<C: TcpServerCallbacks<ClientData = D>>(&mut self, slot: usize, callbacks: &mut C) {
+        let Some(Client { mut stream, data }) = self.clients[slot].take() else {
+            return;
+        };
 
-    'body: {
-        ptr::write(server, TcpServer::zeroed());
-        (*server).max_clients = max_clients;
-        (*server).listen_fd = sys::INVALID_SOCKET;
+        callbacks.on_disconnect(data);
 
-        (*server).poll_fds = xcalloc(max_clients as usize + 1, size_of::<PollFd>()) as *mut PollFd;
-        (*server).clients_data = xcalloc(max_clients as usize, size_of::<*mut c_void>()) as *mut *mut c_void;
+        let _ = self.poll.registry().deregister(&mut stream);
+        drop(stream); // close(Fd)
 
-        listen_fd = sys::socket_tcp();
-        if !sys::is_valid(listen_fd) {
-            is_error = true;
-            break 'body;
-        }
-
-        sys::set_reuse_opts(listen_fd);
-
-        if sys::set_non_blocking(listen_fd) < 0 {
-            is_error = true;
-            break 'body;
-        }
-
-        if sys::bind_any(listen_fd, port) < 0 {
-            is_error = true;
-            break 'body;
-        }
-
-        if sys::listen(listen_fd, 128) < 0 {
-            is_error = true;
-            break 'body;
-        }
-    }
-    // error:
-    if is_error {
-        if sys::is_valid(listen_fd) {
-            sys::close(listen_fd);
-        }
-        xfree((*server).poll_fds as *mut c_void);
-        xfree((*server).clients_data as *mut c_void);
-
-        return -1;
+        self.generations[slot] = self.generations[slot].wrapping_add(1);
+        self.free.push(slot);
+        self.client_count -= 1;
     }
 
-    (*server).listen_fd = listen_fd;
-    (*(*server).poll_fds).fd = listen_fd;
-    (*(*server).poll_fds).events = POLLIN;
-    (*server).running.store(false, Ordering::SeqCst);
+    fn accept_clients<C: TcpServerCallbacks<ClientData = D>>(&mut self, callbacks: &mut C) {
+        loop {
+            let stream = match self.listener.accept() {
+                Ok((stream, _)) => stream,
+                // EAGAIN / EWOULDBLOCK or a real error: both break.
+                Err(_) => break,
+            };
 
-    0
-}
-
-pub unsafe fn tcp_server_destroy(server: *mut TcpServer) {
-    if server.is_null() {
-        return;
-    }
-
-    tcp_server_stop(server);
-
-    for i in 0..(*server).client_count as usize {
-        sys::close((*(*server).poll_fds.add(i + 1)).fd);
-    }
-
-    if sys::is_valid((*server).listen_fd) {
-        sys::close((*server).listen_fd);
-        (*server).listen_fd = sys::INVALID_SOCKET;
-    }
-
-    xfree((*server).poll_fds as *mut c_void);
-    xfree((*server).clients_data as *mut c_void);
-    (*server).poll_fds = ptr::null_mut();
-    (*server).clients_data = ptr::null_mut();
-    (*server).client_count = 0;
-}
-
-pub unsafe fn tcp_server_set_callbacks(
-    server: *mut TcpServer,
-    on_connect: TcpServerOnConnect,
-    on_readable: TcpServerOnReadable,
-    on_disconnect: TcpServerOnDisconnect,
-    user_data: *mut c_void,
-) {
-    if server.is_null() {
-        return;
-    }
-    (*server).on_connect = Some(on_connect);
-    (*server).on_readable = Some(on_readable);
-    (*server).on_disconnect = Some(on_disconnect);
-    (*server).user_data = user_data;
-}
-
-pub unsafe fn tcp_server_stop(server: *mut TcpServer) {
-    if !server.is_null() {
-        (*server).running.store(false, Ordering::SeqCst);
-    }
-}
-
-pub unsafe fn tcp_server_run(server: *mut TcpServer) -> i32 {
-    if server.is_null() || !sys::is_valid((*server).listen_fd) {
-        return -1;
-    }
-
-    (*server).running.store(true, Ordering::SeqCst);
-
-    while (*server).running.load(Ordering::SeqCst) {
-        let nfds = (*server).client_count as usize + 1;
-        let ready = sys::poll((*server).poll_fds, nfds, -1);
-
-        if ready < 0 {
-            if sys::errno_is_eintr() {
+            if self.client_count >= self.max_clients {
+                drop(stream); // close(ClientFd)
                 continue;
             }
-            return -1;
+
+            // mio already made it non-blocking (C: SetNonBlocking).
+            let std_stream = std::net::TcpStream::from(stream);
+            let Some(data) = callbacks.on_connect(&std_stream) else {
+                continue;
+            };
+            let mut stream = TcpStream::from_std(std_stream);
+
+            let slot = self.free.pop().expect("client_count < max_clients");
+            let tok = token(slot, self.generations[slot]);
+            if self.poll.registry().register(&mut stream, tok, Interest::READABLE).is_err() {
+                self.free.push(slot);
+                callbacks.on_disconnect(data);
+                continue;
+            }
+
+            self.clients[slot] = Some(Client { stream, data });
+            self.client_count += 1;
         }
+    }
 
-        if ready == 0 {
-            continue;
-        }
+    /// TcpServerRun
+    pub fn run<C: TcpServerCallbacks<ClientData = D>>(&mut self, callbacks: &mut C) -> i32 {
+        self.running.store(true, Ordering::SeqCst);
 
-        if (*(*server).poll_fds).revents & (POLLIN | POLLERR | POLLHUP) != 0 {
-            loop {
-                let client_fd = sys::accept((*server).listen_fd);
+        let mut events = Events::with_capacity(1024);
 
-                if !sys::is_valid(client_fd) {
-                    // EAGAIN / EWOULDBLOCK or a real error: both break.
-                    break;
+        while self.running.load(Ordering::SeqCst) {
+            if let Err(e) = self.poll.poll(&mut events, None) {
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
                 }
+                return -1;
+            }
 
-                if (*server).client_count >= (*server).max_clients {
-                    sys::close(client_fd);
+            for event in events.iter() {
+                if event.token() == LISTENER {
+                    self.accept_clients(callbacks);
                     continue;
                 }
 
-                if sys::set_non_blocking(client_fd) < 0 {
-                    sys::close(client_fd);
+                let slot = event.token().0 & 0xffff;
+                let generation = (event.token().0 >> 16) as u16;
+                if slot >= self.clients.len() || self.generations[slot] != generation || self.clients[slot].is_none() {
                     continue;
                 }
 
-                let idx = (*server).client_count as usize;
+                // C: POLLERR | POLLHUP | POLLNVAL
+                if event.is_error() {
+                    self.remove_client(slot, callbacks);
+                    continue;
+                }
 
-                *(*server).clients_data.add(idx) = ptr::null_mut();
-                let pfd = (*server).poll_fds.add(idx + 1);
-                (*pfd).fd = client_fd;
-                (*pfd).events = POLLIN;
-                (*pfd).revents = 0;
+                if !event.is_readable() && !event.is_read_closed() {
+                    continue;
+                }
 
-                (*server).client_count += 1;
-
-                ((*server).on_connect.unwrap())(server, client_fd, (*server).clients_data.add(idx));
-            }
-        }
-
-        let mut i = (*server).client_count as i32 - 1;
-        while i >= 0 {
-            let iu = i as usize;
-            let rev = (*(*server).poll_fds.add(iu + 1)).revents;
-            if rev == 0 {
-                i -= 1;
-                continue;
-            }
-
-            let fd = (*(*server).poll_fds.add(iu + 1)).fd;
-            let client_data = *(*server).clients_data.add(iu);
-
-            if rev & (POLLERR | POLLHUP | POLLNVAL) != 0 {
-                remove_client(server, i as u16);
-                i -= 1;
-                continue;
-            }
-
-            if rev & POLLIN != 0 {
                 loop {
-                    let rc = ((*server).on_readable.unwrap())(server, fd, client_data);
-                    if rc == TCP_SERVER_READ_DRAINED {
+                    let Some(client) = self.clients[slot].as_mut() else {
+                        break;
+                    };
+                    let rc = callbacks.on_readable(&mut client.stream, &mut client.data, &mut self.read_buf);
+                    if rc == TCP_SERVER_ERROR_WOULD_BLOCK {
                         break;
                     }
-                    if rc == TCP_SERVER_ERROR_EMPTY_READ {
-                        remove_client(server, i as u16);
-                        break;
-                    }
-                    if rc == TCP_SERVER_ERROR_READ {
-                        if sys::errno_would_block() {
-                            break;
+                    // mio is edge-triggered: it only reports the socket again
+                    // after a read hits WouldBlock, which is what the C loop
+                    // does anyway (read until EAGAIN). On Windows that last
+                    // recv() is an extra syscall per request, plus mio's
+                    // re-arm; reregister() re-arms without it (the AFD poll
+                    // is resubmitted inside the next poll()). On epoll,
+                    // reregister is itself a syscall, so keep C's loop there.
+                    #[cfg(windows)]
+                    if rc == TCP_SERVER_READ_SHORT {
+                        let tok = token(slot, self.generations[slot]);
+                        if self.poll.registry().reregister(&mut client.stream, tok, Interest::READABLE).is_err() {
+                            self.remove_client(slot, callbacks);
                         }
-                        remove_client(server, i as u16);
+                        break;
+                    }
+                    if rc == TCP_SERVER_ERROR_EMPTY_READ || rc == TCP_SERVER_ERROR_READ {
+                        self.remove_client(slot, callbacks);
                         break;
                     }
                 }
             }
-
-            i -= 1;
         }
-    }
 
-    0
+        0
+    }
 }

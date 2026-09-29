@@ -1,8 +1,6 @@
 // Port of Utils.h / Utils.c
-
-use libc::c_char;
-
-use crate::xmalloc::xmalloc;
+//
+// XStrdup is gone: nothing needs NUL-terminated copies any more.
 
 pub fn mkdir_if_not_exists(path: &str) -> Result<(), std::io::Error> {
     // mkdir(Path, 0755)
@@ -19,11 +17,4 @@ pub fn mkdir_if_not_exists(path: &str) -> Result<(), std::io::Error> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(e),
     }
-}
-
-pub unsafe fn xstrdup(str: *const c_char) -> *mut c_char {
-    let len = libc::strlen(str) + 1;
-    let copy = xmalloc(len) as *mut c_char;
-    std::ptr::copy_nonoverlapping(str, copy, len);
-    copy
 }

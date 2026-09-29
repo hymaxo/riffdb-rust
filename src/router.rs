@@ -1,10 +1,9 @@
 // Port of Router.h / Router.c
 
-use libc::c_char;
-use std::ptr;
+use rusqlite::Connection;
 
 use crate::execute::execute;
-use crate::http_response::{http_response_body, http_response_status_code};
+use crate::http_response::HttpResponse;
 use crate::query::query;
 use crate::request::Request;
 
@@ -26,30 +25,26 @@ const EXECUTE_ROUTE: u32 = hash(b"/execute");
 const QUERY_ROUTE: u32 = hash(b"/query");
 const HEALTH_ROUTE: u32 = hash(b"/health");
 
-pub unsafe fn router_route(req: *mut Request) {
-    let res = ptr::addr_of_mut!((*req).state.response);
-
-    let url = &(*req).state.parser.url;
-    let route = hash(std::slice::from_raw_parts(url.as_ptr() as *const u8, url.len()));
+pub fn router_route(req: &Request, db: &Connection, res: &mut HttpResponse) {
+    // C hashes Parser.Url as a C string: the whole array up to its NUL.
+    let route = hash(&req.url);
 
     if route == EXECUTE_ROUTE {
-        execute(req);
+        execute(req, db, res);
         return;
     }
     if route == QUERY_ROUTE {
-        query(req);
+        query(req, db, res);
         return;
     }
     if route == HEALTH_ROUTE {
-        let body = b"health";
-        http_response_status_code(res, 200);
-        http_response_body(res, body.len() as u32, body.as_ptr() as *const c_char);
+        res.status_code(200);
+        res.body(b"health");
         return;
     }
 
-    let body = b"not found";
-    http_response_status_code(res, 404);
-    http_response_body(res, body.len() as u32, body.as_ptr() as *const c_char);
+    res.status_code(404);
+    res.body(b"not found");
 }
 
 #[cfg(test)]
